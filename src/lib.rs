@@ -547,6 +547,20 @@ impl Builder {
             .count();
 
         self.options
+            .no_debug_types
+            .get_items()
+            .iter()
+            .map(|item| {
+                output_vector.push("--no-debug".into());
+                output_vector.push(
+                    item.trim_left_matches("^")
+                        .trim_right_matches("$")
+                        .into(),
+                );
+            })
+            .count();
+
+        self.options
             .no_hash_types
             .get_items()
             .iter()
@@ -1241,6 +1255,13 @@ impl Builder {
         self
     }
 
+    /// Don't derive `Debug` for a given type. Regular
+    /// expressions are supported.
+    pub fn no_debug(mut self, arg: String) -> Self {
+        self.options.no_debug_types.insert(arg);
+        self
+    }
+
     /// Don't derive `Hash` for a given type. Regular
     /// expressions are supported.
     pub fn no_hash<T: Into<String>>(mut self, arg: T) -> Builder {
@@ -1441,7 +1462,6 @@ struct BindgenOptions {
 
     /// The absolute path to the rustfmt configuration file, if None, the standard rustfmt
     /// options are used.
-
     rustfmt_configuration_file: Option<PathBuf>,
 
     /// The set of types that we should not derive `PartialEq` for.
@@ -1449,6 +1469,9 @@ struct BindgenOptions {
 
     /// The set of types that we should not derive `Copy` for.
     no_copy_types: RegexSet,
+
+    /// The set of types that we should not derive `Debug` for.
+    no_debug_types: RegexSet,
 
     /// The set of types that we should not derive `Hash` for.
     no_hash_types: RegexSet,
@@ -1472,6 +1495,7 @@ impl BindgenOptions {
         self.rustified_enums.build();
         self.no_partialeq_types.build();
         self.no_copy_types.build();
+        self.no_debug_types.build();
         self.no_hash_types.build();
     }
 
@@ -1548,6 +1572,7 @@ impl Default for BindgenOptions {
             rustfmt_configuration_file: None,
             no_partialeq_types: Default::default(),
             no_copy_types: Default::default(),
+            no_debug_types: Default::default(),
             no_hash_types: Default::default(),
         }
     }
