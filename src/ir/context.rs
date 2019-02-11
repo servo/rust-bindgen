@@ -1759,6 +1759,8 @@ If you encounter an error missing from this list, please file an issue or a PR!"
                                 .ok(),
                             sub_kind,
                             false,
+                            false,
+                            false,
                         );
                         let sub_id = self.next_item_id();
                         let sub_item = Item::new(
@@ -1824,6 +1826,8 @@ If you encounter an error missing from this list, please file an issue or a PR!"
             ty.fallible_layout().ok(),
             type_kind,
             ty.is_const(),
+            ty.is_volatile(),
+            ty.is_typedef(),
         );
         let item = Item::new(
             with_id,
@@ -1946,6 +1950,8 @@ If you encounter an error missing from this list, please file an issue or a PR!"
             parent_id,
             ty,
             ty.is_const(),
+            ty.is_volatile(),
+            ty.is_typedef(),
         )
     }
 
@@ -1965,6 +1971,8 @@ If you encounter an error missing from this list, please file an issue or a PR!"
             parent_id,
             ty,
             /* is_const = */ true,
+            /* is_volatile = */ false,
+            /* is_typedef = */ false,
         )
     }
 
@@ -1975,11 +1983,13 @@ If you encounter an error missing from this list, please file an issue or a PR!"
         parent_id: Option<ItemId>,
         ty: &clang::Type,
         is_const: bool,
+        is_volatile: bool,
+        is_typedef: bool,
     ) -> TypeId {
         let spelling = ty.spelling();
         let layout = ty.fallible_layout().ok();
         let type_kind = TypeKind::ResolvedTypeRef(wrapped_id);
-        let ty = Type::new(Some(spelling), layout, type_kind, is_const);
+        let ty = Type::new(Some(spelling), layout, type_kind, is_const, is_volatile, is_typedef);
         let item = Item::new(
             with_id,
             None,
@@ -2056,8 +2066,10 @@ If you encounter an error missing from this list, please file an issue or a PR!"
 
         let spelling = ty.spelling();
         let is_const = ty.is_const();
+        let is_volatile = ty.is_volatile();
+        let is_typedef = ty.is_typedef();
         let layout = ty.fallible_layout().ok();
-        let ty = Type::new(Some(spelling), layout, type_kind, is_const);
+        let ty = Type::new(Some(spelling), layout, type_kind, is_const, is_volatile, is_typedef);
         let id = self.next_item_id();
         let item =
             Item::new(id, None, None, self.root_module.into(), ItemKind::Type(ty));

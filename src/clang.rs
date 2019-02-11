@@ -453,6 +453,15 @@ impl Cursor {
             unsafe { clang_Cursor_isFunctionInlined(self.x) != 0 }
     }
 
+    /// Determine the "thread-local storage (TLS) kind" of the declaration.
+    pub fn tls(&self) -> CXTLSKind {
+        if clang_getCursorTLSKind::is_loaded() {
+            unsafe { clang_getCursorTLSKind(self.x) }
+        } else {
+            CXTLS_None
+        }
+    }
+
     /// Get the width of this cursor's referent bit field, or `None` if the
     /// referent is not a bit field.
     pub fn bit_width(&self) -> Option<u32> {
@@ -545,6 +554,15 @@ impl Cursor {
             unsafe { clang_getCursorVisibility(self.x) }
         } else {
             CXVisibility_Default
+        }
+    }
+
+    /// Get the availability of the cursor's referent.
+    pub fn availability(&self) -> CXAvailabilityKind {
+        if clang_getCursorAvailability::is_loaded() {
+            unsafe { clang_getCursorAvailability(self.x) }
+        } else {
+            CXAvailability_Available
         }
     }
 
@@ -929,6 +947,16 @@ impl Type {
     /// Is this type const qualified?
     pub fn is_const(&self) -> bool {
         unsafe { clang_isConstQualifiedType(self.x) != 0 }
+    }
+
+    /// Is this type volatile qualified?
+    pub fn is_volatile(&self) -> bool {
+        unsafe { clang_isVolatileQualifiedType(self.x) != 0 }
+    }
+
+    /// Is this type is typedef?
+    pub fn is_typedef(&self) -> bool {
+        self.x.kind == CXType_Typedef
     }
 
     /// What is the size of this type? Paper over invalid types by returning `0`
@@ -1606,6 +1634,39 @@ pub fn type_to_str(x: CXTypeKind) -> String {
     unsafe { cxstring_into_string(clang_getTypeKindSpelling(x)) }
 }
 
+/// Convert a linkage kind to a static string.
+pub fn linkage_to_str(x: CXLinkageKind) -> &'static str {
+     match x {
+        CXLinkage_Invalid => "invalid",
+        CXLinkage_NoLinkage => "non-extern",
+        CXLinkage_Internal => "internal",
+        CXLinkage_UniqueExternal => "unique-external",
+        CXLinkage_External =>"external",
+        _ => unreachable!(),
+    }
+}
+
+/// Convert a availability kind to a static string.
+pub fn availability_to_str(x: CXAvailabilityKind) -> &'static str {
+    match x {
+        CXAvailability_Available => "available",
+        CXAvailability_Deprecated => "deprecated",
+        CXAvailability_NotAvailable => "not available",
+        CXAvailability_NotAccessible => "not accessible",
+        _ => unreachable!(),
+    }
+}
+
+/// Convert a TLS kind into a static string.
+pub fn tls_to_str(x: CXTLSKind) -> &'static str {
+    match x {
+        CXTLS_None => "none",
+        CXTLS_Dynamic => "dynamic",
+        CXTLS_Static => "static",
+        _ => unreachable!(),
+    }
+}
+
 /// Dump the Clang AST to stdout for debugging purposes.
 pub fn ast_dump(c: &Cursor, depth: isize) -> CXChildVisitResult {
     fn print_indent<S: AsRef<str>>(depth: isize, s: S) {
@@ -1625,6 +1686,15 @@ pub fn ast_dump(c: &Cursor, depth: isize) -> CXChildVisitResult {
             depth,
             format!(" {}spelling = \"{}\"", prefix, c.spelling()),
         );
+        print_indent(
+            depth,
+            format!(" {}linkage = {}", prefix, linkage_to_str(c.linkage())),
+        );
+        print_indent(
+            depth,
+            format!(" {}availability = {}", prefix, availability_to_str(c.availability())),
+        );
+        print_indent(depth, format!(" {}tls-kind = {}", prefix, tls_to_str(c.tls())));
         print_indent(depth, format!(" {}location = {}", prefix, c.location()));
         print_indent(
             depth,
