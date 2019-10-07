@@ -64,4 +64,9 @@ pub trait ParseCallbacks: fmt::Debug + UnwindSafe {
     fn item_name(&self, _original_item_name: &str) -> Option<String> {
         None
     }
+
+    /// Allows to modify the generated bindings before they are formatted and written.
+    fn bindings(&self, _bindings: &str) -> Option<String> {
+        None
+    }
 }

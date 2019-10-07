@@ -1928,6 +1928,10 @@ impl Bindings {
 
         let bindings = self.module.to_string();
 
+        let bindings = self.options.parse_callbacks.as_ref()
+            .and_then(|callbacks| callbacks.bindings(&bindings))
+            .unwrap_or(bindings);
+
         match self.rustfmt_generated_string(&bindings) {
             Ok(rustfmt_bindings) => {
                 writer.write(rustfmt_bindings.as_bytes())?;
