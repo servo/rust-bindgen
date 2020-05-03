@@ -1952,32 +1952,6 @@ impl Default for BindgenOptions {
     }
 }
 
-#[cfg(feature = "runtime")]
-fn ensure_libclang_is_loaded() {
-    if clang_sys::is_loaded() {
-        return;
-    }
-
-    // XXX (issue #350): Ensure that our dynamically loaded `libclang`
-    // doesn't get dropped prematurely, nor is loaded multiple times
-    // across different threads.
-
-    lazy_static! {
-        static ref LIBCLANG: std::sync::Arc<clang_sys::SharedLibrary> = {
-            clang_sys::load().expect("Unable to find libclang");
-            clang_sys::get_library().expect(
-                "We just loaded libclang and it had better still be \
-                 here!",
-            )
-        };
-    }
-
-    clang_sys::set_library(Some(LIBCLANG.clone()));
-}
-
-#[cfg(not(feature = "runtime"))]
-fn ensure_libclang_is_loaded() {}
-
 /// Generated Rust bindings.
 #[derive(Debug)]
 pub struct Bindings {
@@ -1990,16 +1964,6 @@ impl Bindings {
     pub(crate) fn generate(
         mut options: BindgenOptions,
     ) -> Result<Bindings, ()> {
-        ensure_libclang_is_loaded();
-
-        #[cfg(feature = "runtime")]
-        debug!(
-            "Generating bindings, libclang at {}",
-            clang_sys::get_library().unwrap().path().display()
-        );
-        #[cfg(not(feature = "runtime"))]
-        debug!("Generating bindings, libclang linked");
-
         options.build();
 
         fn detect_include_paths(options: &mut BindgenOptions) {
@@ -2286,12 +2250,12 @@ fn parse_one(
     ctx: &mut BindgenContext,
     cursor: clang::Cursor,
     parent: Option<ItemId>,
-) -> clang_sys::CXChildVisitResult {
+) -> clang::CXChildVisitResult {
     if !filter_builtins(ctx, &cursor) {
         return CXChildVisit_Continue;
     }
 
-    use clang_sys::CXChildVisit_Continue;
+    use clang::CXChildVisit_Continue;
     match Item::parse(cursor, parent, ctx) {
         Ok(..) => {}
         Err(ParseError::Continue) => {}
@@ -2304,12 +2268,10 @@ fn parse_one(
 
 /// Parse the Clang AST into our `Item` internal representation.
 fn parse(context: &mut BindgenContext) -> Result<(), ()> {
-    use clang_sys::*;
-
     let mut any_error = false;
     for d in context.translation_unit().diags().iter() {
         let msg = d.format();
-        let is_err = d.severity() >= CXDiagnostic_Error;
+        let is_err = d.severity() >= clang::CXDiagnostic_Error;
         eprintln!("{}, err: {}", msg, is_err);
         any_error |= is_err;
     }
@@ -2321,11 +2283,11 @@ fn parse(context: &mut BindgenContext) -> Result<(), ()> {
     let cursor = context.translation_unit().cursor();
 
     if context.options().emit_ast {
-        fn dump_if_not_builtin(cur: &clang::Cursor) -> CXChildVisitResult {
+        fn dump_if_not_builtin(cur: &clang::Cursor) -> clang::CXChildVisitResult {
             if !cur.is_builtin() {
                 clang::ast_dump(&cur, 0)
             } else {
-                CXChildVisit_Continue
+                clang::CXChildVisit_Continue
             }
         }
         cursor.visit(|cur| dump_if_not_builtin(&cur));
@@ -2354,8 +2316,6 @@ pub struct ClangVersion {
 
 /// Get the major and the minor semver numbers of Clang's version
 pub fn clang_version() -> ClangVersion {
-    ensure_libclang_is_loaded();
-
     let raw_v: String = clang::extract_clang_version();
     let split_v: Option<Vec<&str>> = raw_v
         .split_whitespace()

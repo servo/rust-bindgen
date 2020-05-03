@@ -5,22 +5,150 @@
 
 
 use cexpr;
-use clang_sys::*;
 use ir::context::BindgenContext;
 use regex;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::hash::Hash;
-use std::hash::Hasher;
 use std::os::raw::{c_char, c_int, c_longlong, c_uint, c_ulong, c_ulonglong};
 use std::{mem, ptr, slice};
+
+#[allow(non_camel_case_types, non_snake_case, missing_docs)]
+mod clang_interface;
+pub use self::clang_interface::CXCallingConv::Type as CXCallingConv;
+pub use self::clang_interface::CXCallingConv::*;
+pub use self::clang_interface::CXChildVisitResult::Type as CXChildVisitResult;
+pub use self::clang_interface::CXChildVisitResult::*;
+pub use self::clang_interface::CXCommentKind::*;
+pub use self::clang_interface::CXCursorKind::Type as CXCursorKind;
+pub use self::clang_interface::CXCursorKind::*;
+pub use self::clang_interface::CXDiagnosticSeverity::Type as CXDiagnosticSeverity;
+pub use self::clang_interface::CXDiagnosticSeverity::*;
+pub use self::clang_interface::CXEvalResultKind::Type as CXEvalResultKind;
+pub use self::clang_interface::CXEvalResultKind::*;
+pub use self::clang_interface::CXLinkageKind::Type as CXLinkageKind;
+pub use self::clang_interface::CXLinkageKind::*;
+pub use self::clang_interface::CXTokenKind::Type as CXTokenKind;
+pub use self::clang_interface::CXTokenKind::*;
+pub use self::clang_interface::CXTranslationUnit_Flags::Type as CXTranslationUnit_Flags;
+pub use self::clang_interface::CXTranslationUnit_Flags::*;
+pub use self::clang_interface::CXTypeKind::Type as CXTypeKind;
+pub use self::clang_interface::CXTypeKind::*;
+pub use self::clang_interface::CXVisibilityKind::Type as CXVisibilityKind;
+pub use self::clang_interface::CXVisibilityKind::*;
+pub use self::clang_interface::CXVisitorResult::*;
+pub use self::clang_interface::CX_CXXAccessSpecifier::Type as CX_CXXAccessSpecifier;
+pub use self::clang_interface::CX_CXXAccessSpecifier::*;
+
+impl clang_interface::BindgenSourceRange {
+    fn null() -> Self {
+        Self {
+            B: ptr::null_mut(),
+            E: ptr::null_mut(),
+        }
+    }
+}
+
+impl Drop for clang_interface::BindgenSourceRange {
+    fn drop(&mut self) {
+        unsafe { clang_interface::deleteSourceRange(self); }
+    }
+}
+
+trait ToCString {
+    fn to_cstring(&self) -> CString;
+}
+
+impl ToCString for clang_interface::BindgenStringRef {
+    fn to_cstring(&self) -> CString {
+        if !self.s.is_null() {
+            unsafe { CStr::from_ptr(self.s).into() }
+        } else {
+            return CString::new("").unwrap();
+        }
+    }
+}
+
+impl fmt::Display for clang_interface::BindgenStringRef {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let str = self.to_cstring();
+        write!(f, "{}", str.to_str().unwrap())
+    }
+}
+
+impl Drop for clang_interface::BindgenStringRef {
+    fn drop(&mut self) {
+        unsafe { clang_interface::deleteString(self); }
+    }
+}
+
+impl Drop for clang_interface::BindgenStringRefSet {
+    fn drop(&mut self) {
+        unsafe { clang_interface::deleteStringSet(self); }
+    }
+}
 
 /// A cursor into the Clang AST, pointing to an AST node.
 ///
 /// We call the AST node pointed to by the cursor the cursor's "referent".
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Cursor {
-    x: CXCursor,
+    node: ASTNode,
+
+    /// Kind of this cursor, may differ from the kind of the node, e.g. TypeRef
+    /// kind referring to a ClassDecl.
+    kind: CXCursorKind,
+
+    /// AST unit that this cursor is part of.
+    ///
+    /// Some clang interfaces require access to an ASTUnit, so we keep this
+    /// available.
+    unit: *mut clang_interface::clang_ASTUnit,
+}
+
+/// Clang AST nodes.
+///
+/// Each variant wraps a raw pointer to a type of Clang AST node that we handle.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub enum ASTNode {
+    /// Placeholder for an invalid AST node
+    Invalid,
+
+    /// Declaration AST node (const Decl*)
+    Decl(*const clang_interface::clang_Decl),
+
+    /// Expression AST node (const Expr*)
+    Expr(*const clang_interface::clang_Expr),
+
+    /// C++ base specifier AST node (const CXXBaseSpecifier*)
+    CXXBaseSpecifier(*const clang_interface::clang_CXXBaseSpecifier),
+
+    /// Attribute AST node (const Attr*)
+    Attr(*const clang_interface::clang_Attr),
+
+    /// Preprocessor entity node (const PreprocessedEntity*)
+    PreprocessedEntity(*const clang_interface::clang_PreprocessedEntity),
+}
+
+impl ASTNode {
+    /// Is this node valid?
+    fn is_valid(&self) -> bool {
+        unsafe { !clang_interface::CursorKind_isInvalid(self.kind()) }
+    }
+
+    /// Kind of the AST node. This is NOT the kind of the cursor itself, and may
+    /// differ from a cursor holding the node.
+    fn kind(&self) -> CXCursorKind {
+        unsafe {
+            match *self {
+                ASTNode::Decl(d) => clang_interface::Decl_getCXCursorKind(d),
+                ASTNode::Expr(e) => clang_interface::Expr_getCXCursorKind(e),
+                ASTNode::CXXBaseSpecifier(_) => CXCursor_CXXBaseSpecifier,
+                ASTNode::Attr(a) => clang_interface::Attr_getCXCursorKind(a),
+                _ => CXCursor_InvalidFile,
+            }
+        }
+    }
 }
 
 impl fmt::Debug for Cursor {
@@ -37,13 +165,39 @@ impl fmt::Debug for Cursor {
 }
 
 impl Cursor {
+    /// Create a new Cursor from an ASTNode and a clang ASTUnit
+    fn new(node: ASTNode, unit: *mut clang_interface::clang_ASTUnit) -> Self {
+        Self {
+            node,
+            kind: node.kind(),
+            unit,
+        }
+    }
+
+    /// Create a new Cursor with the given ASTNode in the same clang ASTUnit as
+    /// self.
+    fn with_node(&self, node: ASTNode) -> Self {
+        Self::new(node, self.unit)
+    }
+
+    /// Get the clang ASTContext for this cursor
+    fn context(&self) -> *mut clang_interface::clang_ASTContext {
+        unsafe { clang_interface::ASTUnit_getContext(self.unit) }
+    }
+
     /// Get the Unified Symbol Resolution for this cursor's referent, if
     /// available.
     ///
     /// The USR can be used to compare entities across translation units.
     pub fn usr(&self) -> Option<String> {
-        let s = unsafe { cxstring_into_string(clang_getCursorUSR(self.x)) };
-        if s.is_empty() {
+        let s = unsafe {
+            match self.node {
+                ASTNode::Decl(d) => clang_interface::Decl_getUSR(d),
+                _ => return None,
+            }
+        };
+        let s = s.to_string();
+        if s.len() == 0 {
             None
         } else {
             Some(s)
@@ -52,51 +206,64 @@ impl Cursor {
 
     /// Is this cursor's referent a declaration?
     pub fn is_declaration(&self) -> bool {
-        unsafe { clang_isDeclaration(self.kind()) != 0 }
+        match self.node {
+            ASTNode::Decl(_) => true,
+            _ => false,
+        }
     }
 
     /// Get this cursor's referent's spelling.
     pub fn spelling(&self) -> String {
-        unsafe { cxstring_into_string(clang_getCursorSpelling(self.x)) }
-    }
-
-    /// Get this cursor's referent's display name.
-    ///
-    /// This is not necessarily a valid identifier. It includes extra
-    /// information, such as parameters for a function, etc.
-    pub fn display_name(&self) -> String {
-        unsafe { cxstring_into_string(clang_getCursorDisplayName(self.x)) }
+        unsafe {
+            match self.node {
+                ASTNode::Decl(d) => {
+                    clang_interface::Decl_getSpelling(d).to_string()
+                }
+                ASTNode::Expr(e) => {
+                    clang_interface::Expr_getSpelling(e).to_string()
+                }
+                ASTNode::CXXBaseSpecifier(b) => {
+                    clang_interface::CXXBaseSpecifier_getSpelling(b).to_string()
+                }
+                ASTNode::PreprocessedEntity(e) => {
+                    clang_interface::PreprocessedEntity_getSpelling(e)
+                        .to_string()
+                }
+                _ => String::new(),
+            }
+        }
     }
 
     /// Get the mangled name of this cursor's referent.
     pub fn mangling(&self) -> String {
-        if clang_Cursor_getMangling::is_loaded() {
-            unsafe { cxstring_into_string(clang_Cursor_getMangling(self.x)) }
-        } else {
-            self.spelling()
+        unsafe {
+            match self.node {
+                ASTNode::Decl(d) => {
+                    clang_interface::Decl_getMangling(d, self.context())
+                        .to_string()
+                }
+                _ => String::new(),
+            }
         }
     }
 
     /// Gets the C++ manglings for this cursor, or an error if the function is
     /// not loaded or the manglings are not available.
     pub fn cxx_manglings(&self) -> Result<Vec<String>, ()> {
-        use clang_sys::*;
-        if !clang_Cursor_getCXXManglings::is_loaded() {
-            return Err(());
-        }
         unsafe {
-            let manglings = clang_Cursor_getCXXManglings(self.x);
-            if manglings.is_null() {
-                return Err(());
-            }
-            let count = (*manglings).Count as usize;
+            let manglings = match self.node {
+                ASTNode::Decl(d) => {
+                    clang_interface::Decl_getCXXManglings(d, self.context())
+                }
+                _ => return Err(()),
+            };
+            let count = manglings.len as usize;
 
             let mut result = Vec::with_capacity(count);
             for i in 0..count {
-                let string_ptr = (*manglings).Strings.offset(i as isize);
-                result.push(cxstring_to_string_leaky(*string_ptr));
+                let string_ptr = manglings.strings.offset(i as isize);
+                result.push((*string_ptr).to_string());
             }
-            clang_disposeStringSet(manglings);
             Ok(result)
         }
     }
@@ -125,11 +292,13 @@ impl Cursor {
     /// void Foo::method() { /* ... */ }
     /// ```
     pub fn lexical_parent(&self) -> Cursor {
-        unsafe {
-            Cursor {
-                x: clang_getCursorLexicalParent(self.x),
-            }
-        }
+        let node = match self.node {
+            ASTNode::Decl(d) => unsafe {
+                ASTNode::Decl(clang_interface::Decl_getLexicalParent(d))
+            },
+            _ => ASTNode::Invalid,
+        };
+        self.with_node(node)
     }
 
     /// Get the referent's semantic parent, if one is available.
@@ -137,15 +306,17 @@ impl Cursor {
     /// See documentation for `lexical_parent` for details on semantic vs
     /// lexical parents.
     pub fn fallible_semantic_parent(&self) -> Option<Cursor> {
-        let sp = unsafe {
-            Cursor {
-                x: clang_getCursorSemanticParent(self.x),
-            }
+        let node = match self.node {
+            ASTNode::Decl(d) => unsafe {
+                ASTNode::Decl(clang_interface::Decl_getSemanticParent(d))
+            },
+            ASTNode::Expr(_) => panic!("Unimplemented for Expr"),
+            _ => return None,
         };
-        if sp == *self || !sp.is_valid() {
+        if node == self.node || !node.is_valid() {
             return None;
         }
-        Some(sp)
+        Some(self.with_node(node))
     }
 
     /// Get the referent's semantic parent.
@@ -167,11 +338,17 @@ impl Cursor {
         // `clang_Cursor_getNumTemplateArguments` is totally unreliable.
         // Therefore, try former first, and only fallback to the latter if we
         // have to.
+        let decl = if let ASTNode::Decl(decl) = self.node {
+            decl
+        } else {
+            return None;
+        };
         self.cur_type()
             .num_template_args()
             .or_else(|| {
-                let n: c_int =
-                    unsafe { clang_Cursor_getNumTemplateArguments(self.x) };
+                let n: c_int = unsafe {
+                    clang_interface::Decl_getNumTemplateArguments(decl)
+                };
 
                 if n >= 0 {
                     Some(n as u32)
@@ -196,33 +373,26 @@ impl Cursor {
     /// bindgen assumes there will only be one of them alive at a time, and
     /// disposes it on drop. That can change if this would be required, but I
     /// think we can survive fine without it.
-    pub fn translation_unit(&self) -> Cursor {
-        assert!(self.is_valid());
-        unsafe {
-            let tu = clang_Cursor_getTranslationUnit(self.x);
-            let cursor = Cursor {
-                x: clang_getTranslationUnitCursor(tu),
-            };
-            assert!(cursor.is_valid());
-            cursor
-        }
+    pub fn translation_unit(&self) -> *mut clang_interface::clang_ASTUnit {
+        self.unit
     }
 
     /// Is the referent a top level construct?
     pub fn is_toplevel(&self) -> bool {
         let mut semantic_parent = self.fallible_semantic_parent();
 
-        while semantic_parent.is_some() &&
-            (semantic_parent.unwrap().kind() == CXCursor_Namespace ||
-                semantic_parent.unwrap().kind() ==
-                    CXCursor_NamespaceAlias ||
-                semantic_parent.unwrap().kind() == CXCursor_NamespaceRef)
+        while semantic_parent.is_some()
+            && (semantic_parent.unwrap().kind() == CXCursor_Namespace
+                || semantic_parent.unwrap().kind() == CXCursor_NamespaceAlias
+                || semantic_parent.unwrap().kind() == CXCursor_NamespaceRef)
         {
             semantic_parent =
                 semantic_parent.unwrap().fallible_semantic_parent();
         }
 
-        let tu = self.translation_unit();
+        let tu = self.with_node(ASTNode::Decl(unsafe {
+            clang_interface::getTranslationUnitDecl(self.unit)
+        }));
         // Yes, this can happen with, e.g., macro definitions.
         semantic_parent == tu.fallible_semantic_parent()
     }
@@ -232,21 +402,26 @@ impl Cursor {
     /// clang doesn't expose a proper declaration for these types.
     pub fn is_template_like(&self) -> bool {
         match self.kind() {
-            CXCursor_ClassTemplate |
-            CXCursor_ClassTemplatePartialSpecialization |
-            CXCursor_TypeAliasTemplateDecl => true,
+            CXCursor_ClassTemplate
+            | CXCursor_ClassTemplatePartialSpecialization
+            | CXCursor_TypeAliasTemplateDecl => true,
             _ => false,
         }
     }
 
     /// Get the kind of referent this cursor is pointing to.
     pub fn kind(&self) -> CXCursorKind {
-        self.x.kind
+        self.kind
     }
 
     /// Returns true is the cursor is a definition
     pub fn is_definition(&self) -> bool {
-        unsafe { clang_isCursorDefinition(self.x) != 0 }
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::Decl_isDefinition(d)
+            },
+            _ => false,
+        }
     }
 
     /// Is the referent a template specialization?
@@ -257,9 +432,9 @@ impl Cursor {
     /// Is the referent a fully specialized template specialization without any
     /// remaining free template arguments?
     pub fn is_fully_specialized_template(&self) -> bool {
-        self.is_template_specialization() &&
-            self.kind() != CXCursor_ClassTemplatePartialSpecialization &&
-            self.num_template_args().unwrap_or(0) > 0
+        self.is_template_specialization()
+            && self.kind() != CXCursor_ClassTemplatePartialSpecialization
+            && self.num_template_args().unwrap_or(0) > 0
     }
 
     /// Is the referent a template specialization that still has remaining free
@@ -283,27 +458,59 @@ impl Cursor {
 
     /// Is this cursor pointing a valid referent?
     pub fn is_valid(&self) -> bool {
-        unsafe { clang_isInvalid(self.kind()) == 0 }
+        unsafe { !clang_interface::CursorKind_isInvalid(self.kind) }
     }
 
     /// Get the source location for the referent.
     pub fn location(&self) -> SourceLocation {
         unsafe {
-            SourceLocation {
-                x: clang_getCursorLocation(self.x),
-            }
+            let x = match self.node {
+                ASTNode::Decl(d) => clang_interface::Decl_getLocation(d),
+                ASTNode::Expr(e) => clang_interface::Expr_getLocation(e),
+                ASTNode::CXXBaseSpecifier(b) => {
+                    clang_interface::CXXBaseSpecifier_getLocation(b)
+                }
+                ASTNode::Attr(b) => clang_interface::Attr_getLocation(b),
+                ASTNode::PreprocessedEntity(p) => {
+                    clang_interface::PreprocessedEntity_getLocation(p)
+                }
+                ASTNode::Invalid => ptr::null_mut(),
+            };
+            SourceLocation { x, unit: self.unit }
         }
     }
 
     /// Get the source location range for the referent.
-    pub fn extent(&self) -> CXSourceRange {
-        unsafe { clang_getCursorExtent(self.x) }
+    ///
+    /// Warning: This range goes from the start of the first token to the start
+    /// of the last token, unlike the ranges provided by libclang, which are
+    /// half-open ranges of characters (end is past the last character in the
+    /// last token).
+    pub fn extent(&self) -> clang_interface::BindgenSourceRange {
+        unsafe {
+            match self.node {
+                ASTNode::Decl(d) => clang_interface::Decl_getSourceRange(d),
+                ASTNode::Expr(e) => clang_interface::Expr_getSourceRange(e),
+                ASTNode::CXXBaseSpecifier(b) => {
+                    clang_interface::CXXBaseSpecifier_getSourceRange(b)
+                }
+                ASTNode::Attr(b) => clang_interface::Attr_getSourceRange(b),
+                ASTNode::PreprocessedEntity(b) => {
+                    clang_interface::PreprocessedEntity_getSourceRange(b)
+                }
+                _ => clang_interface::BindgenSourceRange::null(),
+            }
+        }
     }
 
     /// Get the raw declaration comment for this referent, if one exists.
     pub fn raw_comment(&self) -> Option<String> {
-        let s = unsafe {
-            cxstring_into_string(clang_Cursor_getRawCommentText(self.x))
+        let s = match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::Decl_getRawCommentText(d, self.context())
+                    .to_string()
+            },
+            _ => return None,
         };
         if s.is_empty() {
             None
@@ -314,19 +521,29 @@ impl Cursor {
 
     /// Get the referent's parsed comment.
     pub fn comment(&self) -> Comment {
-        unsafe {
-            Comment {
-                x: clang_Cursor_getParsedComment(self.x),
-            }
-        }
+        let x = match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::Decl_getParsedComment(d, self.context())
+            },
+            _ => ptr::null(),
+        };
+        Comment { x }
     }
 
     /// Get the referent's type.
     pub fn cur_type(&self) -> Type {
         unsafe {
-            Type {
-                x: clang_getCursorType(self.x),
-            }
+            let x = match self.node {
+                ASTNode::Decl(d) => {
+                    clang_interface::Decl_getType(d, self.context())
+                }
+                ASTNode::Expr(e) => clang_interface::Expr_getType(e),
+                ASTNode::CXXBaseSpecifier(base) => {
+                    clang_interface::CXXBaseSpecifier_getType(base)
+                }
+                _ => mem::zeroed(),
+            };
+            Type { x, unit: self.unit }
         }
     }
 
@@ -334,32 +551,34 @@ impl Cursor {
     /// a declaration, get the cursor pointing to the referenced type or type of
     /// the declared thing.
     pub fn definition(&self) -> Option<Cursor> {
-        unsafe {
-            let ret = Cursor {
-                x: clang_getCursorDefinition(self.x),
-            };
-
-            if ret.is_valid() && ret.kind() != CXCursor_NoDeclFound {
-                Some(ret)
-            } else {
-                None
-            }
+        let is_reference =
+            self.kind >= CXCursor_FirstRef && self.kind <= CXCursor_LastRef;
+        let def = match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::Decl_getDefinition(d, is_reference)
+            },
+            _ => return None,
+        };
+        if def.is_null() {
+            None
+        } else {
+            Some(self.with_node(ASTNode::Decl(def)))
         }
     }
 
     /// Given that this cursor's referent is reference type, get the cursor
     /// pointing to the referenced type.
     pub fn referenced(&self) -> Option<Cursor> {
-        unsafe {
-            let ret = Cursor {
-                x: clang_getCursorReferenced(self.x),
-            };
-
-            if ret.is_valid() {
-                Some(ret)
-            } else {
-                None
-            }
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                let ptr = clang_interface::Decl_getReferenced(d);
+                if ptr.is_null() {
+                    None
+                } else {
+                    Some(self.with_node(ASTNode::Decl(ptr)))
+                }
+            },
+            _ => return None,
         }
     }
 
@@ -369,33 +588,41 @@ impl Cursor {
     /// defined. This method allows us to get the canonical cursor for the
     /// referent type.
     pub fn canonical(&self) -> Cursor {
-        unsafe {
-            Cursor {
-                x: clang_getCanonicalCursor(self.x),
-            }
-        }
+        let node = match self.node {
+            ASTNode::Decl(d) => unsafe {
+                ASTNode::Decl(clang_interface::Decl_getCanonical(d))
+            },
+            _ => ASTNode::Invalid,
+        };
+        self.with_node(node)
     }
 
     /// Given that this cursor points to either a template specialization or a
     /// template instantiation, get a cursor pointing to the template definition
     /// that is being specialized.
     pub fn specialized(&self) -> Option<Cursor> {
-        unsafe {
-            let ret = Cursor {
-                x: clang_getSpecializedCursorTemplate(self.x),
-            };
-            if ret.is_valid() {
-                Some(ret)
-            } else {
-                None
-            }
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                let ptr = clang_interface::Decl_getSpecializedTemplate(d);
+                if ptr.is_null() {
+                    None
+                } else {
+                    Some(self.with_node(ASTNode::Decl(ptr)))
+                }
+            },
+            _ => None,
         }
     }
 
     /// Assuming that this cursor's referent is a template declaration, get the
     /// kind of cursor that would be generated for its specializations.
     pub fn template_kind(&self) -> CXCursorKind {
-        unsafe { clang_getTemplateCursorKind(self.x) }
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::Decl_getTemplateCursorKind(d)
+            },
+            _ => CXCursor_NoDeclFound,
+        }
     }
 
     /// Traverse this cursor's referent and its children.
@@ -405,12 +632,35 @@ impl Cursor {
     where
         Visitor: FnMut(Cursor) -> CXChildVisitResult,
     {
-        unsafe {
-            clang_visitChildren(
-                self.x,
-                visit_children::<Visitor>,
-                mem::transmute(&mut visitor),
-            );
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::Decl_visitChildren(
+                    d,
+                    self.kind,
+                    Some(visit_children::<Visitor>),
+                    self.unit,
+                    mem::transmute(&mut visitor),
+                );
+            },
+            ASTNode::Expr(e) => unsafe {
+                clang_interface::Expr_visitChildren(
+                    e,
+                    self.kind,
+                    Some(visit_children::<Visitor>),
+                    self.unit,
+                    mem::transmute(&mut visitor),
+                );
+            },
+            ASTNode::CXXBaseSpecifier(b) => unsafe {
+                clang_interface::CXXBaseSpecifier_visitChildren(
+                    b,
+                    self.kind,
+                    Some(visit_children::<Visitor>),
+                    self.unit,
+                    mem::transmute(&mut visitor),
+                );
+            },
+            _ => panic!("Tried to visit: {:?}", self),
         }
     }
 
@@ -469,35 +719,45 @@ impl Cursor {
 
     /// Is the referent an inlined function?
     pub fn is_inlined_function(&self) -> bool {
-        clang_Cursor_isFunctionInlined::is_loaded() &&
-            unsafe { clang_Cursor_isFunctionInlined(self.x) != 0 }
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::Decl_isFunctionInlined(d)
+            },
+            _ => false,
+        }
     }
 
     /// Get the width of this cursor's referent bit field, or `None` if the
     /// referent is not a bit field.
     pub fn bit_width(&self) -> Option<u32> {
-        unsafe {
-            let w = clang_getFieldDeclBitWidth(self.x);
-            if w == -1 {
-                None
-            } else {
-                Some(w as u32)
-            }
+        let w = match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::Decl_getFieldDeclBitWidth(d, self.context())
+            },
+            _ => -1,
+        };
+        if w == -1 {
+            None
+        } else {
+            Some(w as u32)
         }
     }
 
     /// Get the integer representation type used to hold this cursor's referent
     /// enum type.
     pub fn enum_type(&self) -> Option<Type> {
-        unsafe {
-            let t = Type {
-                x: clang_getEnumDeclIntegerType(self.x),
-            };
-            if t.is_valid() {
-                Some(t)
-            } else {
-                None
+        let x = unsafe {
+            match self.node {
+                ASTNode::Decl(d) => {
+                    clang_interface::Decl_getEnumDeclIntegerType(d)
+                }
+                _ => mem::zeroed(),
             }
+        };
+        if x.is_null() {
+            None
+        } else {
+            Some(Type { x, unit: self.unit })
         }
     }
 
@@ -505,12 +765,11 @@ impl Cursor {
     ///
     /// Returns None if the cursor's referent is not an enum variant.
     pub fn enum_val_signed(&self) -> Option<i64> {
-        unsafe {
-            if self.kind() == CXCursor_EnumConstantDecl {
-                Some(clang_getEnumConstantDeclValue(self.x) as i64)
-            } else {
-                None
-            }
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                Some(clang_interface::Decl_getEnumConstantValue(d))
+            },
+            _ => None,
         }
     }
 
@@ -518,12 +777,11 @@ impl Cursor {
     ///
     /// Returns None if the cursor's referent is not an enum variant.
     pub fn enum_val_unsigned(&self) -> Option<u64> {
-        unsafe {
-            if self.kind() == CXCursor_EnumConstantDecl {
-                Some(clang_getEnumConstantDeclUnsignedValue(self.x) as u64)
-            } else {
-                None
-            }
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                Some(clang_interface::Decl_getEnumConstantUnsignedValue(d))
+            },
+            _ => None,
         }
     }
 
@@ -541,11 +799,11 @@ impl Cursor {
         let mut found_attr = false;
         self.visit(|cur| {
             let kind = cur.kind();
-            found_attr = clang_kind.map_or(false, |k| k == kind) ||
-                (kind == CXCursor_UnexposedAttr &&
-                    cur.tokens().iter().any(|t| {
-                        t.kind == CXToken_Identifier &&
-                            t.spelling() == name.as_bytes()
+            found_attr = clang_kind.map_or(false, |k| k == kind)
+                || (kind == CXCursor_UnexposedAttr
+                    && cur.tokens().iter().any(|t| {
+                        t.kind == CXToken_Identifier
+                            && t.spelling() == name.as_bytes()
                     }));
 
             if found_attr {
@@ -561,14 +819,14 @@ impl Cursor {
     /// Given that this cursor's referent is a `typedef`, get the `Type` that is
     /// being aliased.
     pub fn typedef_type(&self) -> Option<Type> {
-        let inner = Type {
-            x: unsafe { clang_getTypedefDeclUnderlyingType(self.x) },
-        };
-
-        if inner.is_valid() {
-            Some(inner)
-        } else {
-            None
+        match self.node {
+            ASTNode::Decl(d) => Some(Type {
+                x: unsafe {
+                    clang_interface::Decl_getTypedefDeclUnderlyingType(d)
+                },
+                unit: self.unit,
+            }),
+            _ => None,
         }
     }
 
@@ -576,15 +834,19 @@ impl Cursor {
     ///
     /// This only applies to functions and variables.
     pub fn linkage(&self) -> CXLinkageKind {
-        unsafe { clang_getCursorLinkage(self.x) }
+        match self.node {
+            ASTNode::Decl(d) => unsafe { clang_interface::Decl_getLinkage(d) },
+            _ => CXLinkage_Invalid,
+        }
     }
 
     /// Get the visibility of this cursor's referent.
     pub fn visibility(&self) -> CXVisibilityKind {
-        if clang_getCursorVisibility::is_loaded() {
-            unsafe { clang_getCursorVisibility(self.x) }
-        } else {
-            CXVisibility_Default
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::Decl_getVisibility(d)
+            },
+            _ => CXVisibility_Invalid,
         }
     }
 
@@ -599,8 +861,23 @@ impl Cursor {
         // CXCursor_CXXMethod => {
         self.num_args().ok().map(|num| {
             (0..num)
-                .map(|i| Cursor {
-                    x: unsafe { clang_Cursor_getArgument(self.x, i as c_uint) },
+                .map(|i| {
+                    let node = match self.node {
+                        ASTNode::Decl(d) => unsafe {
+                            ASTNode::Decl(clang_interface::Decl_getArgument(
+                                d,
+                                i as c_uint,
+                            ))
+                        },
+                        ASTNode::Expr(e) => unsafe {
+                            ASTNode::Expr(clang_interface::Expr_getArgument(
+                                e,
+                                i as c_uint,
+                            ))
+                        },
+                        _ => ASTNode::Invalid,
+                    };
+                    self.with_node(node)
                 })
                 .collect()
         })
@@ -612,36 +889,52 @@ impl Cursor {
     /// Returns Err if the cursor's referent is not a function/method call or
     /// declaration.
     pub fn num_args(&self) -> Result<u32, ()> {
-        unsafe {
-            let w = clang_Cursor_getNumArguments(self.x);
-            if w == -1 {
-                Err(())
-            } else {
-                Ok(w as u32)
-            }
+        let w = match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::Decl_getNumArguments(d)
+            },
+            ASTNode::Expr(e) => unsafe {
+                clang_interface::Expr_getNumArguments(e)
+            },
+            _ => -1,
+        };
+        if w == -1 {
+            Err(())
+        } else {
+            Ok(w as u32)
         }
     }
 
     /// Get the access specifier for this cursor's referent.
     pub fn access_specifier(&self) -> CX_CXXAccessSpecifier {
-        unsafe { clang_getCXXAccessSpecifier(self.x) }
+        match self.node {
+            ASTNode::Decl(d) => unsafe { clang_interface::Decl_getAccess(d) },
+            ASTNode::CXXBaseSpecifier(b) => unsafe {
+                clang_interface::CXXBaseSpecifier_getAccess(b)
+            },
+            _ => CX_CXXInvalidAccessSpecifier,
+        }
     }
 
     /// Is this cursor's referent a field declaration that is marked as
     /// `mutable`?
     pub fn is_mutable_field(&self) -> bool {
-        clang_CXXField_isMutable::is_loaded() &&
-            unsafe { clang_CXXField_isMutable(self.x) != 0 }
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::CXXField_isMutable(d)
+            },
+            _ => false,
+        }
     }
 
     /// Get the offset of the field represented by the Cursor.
     pub fn offset_of_field(&self) -> Result<usize, LayoutError> {
-        if !clang_Cursor_getOffsetOfField::is_loaded() {
-            return Err(LayoutError::from(-1));
-        }
-
-        let offset = unsafe { clang_Cursor_getOffsetOfField(self.x) };
-
+        let offset = match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::Decl_getOffsetOfField(d, self.context())
+            },
+            _ => -1,
+        };
         if offset < 0 {
             Err(LayoutError::from(offset as i32))
         } else {
@@ -651,43 +944,100 @@ impl Cursor {
 
     /// Is this cursor's referent a member function that is declared `static`?
     pub fn method_is_static(&self) -> bool {
-        unsafe { clang_CXXMethod_isStatic(self.x) != 0 }
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::CXXMethod_isStatic(d)
+            },
+            _ => false,
+        }
     }
 
     /// Is this cursor's referent a member function that is declared `const`?
     pub fn method_is_const(&self) -> bool {
-        unsafe { clang_CXXMethod_isConst(self.x) != 0 }
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::CXXMethod_isConst(d)
+            },
+            _ => false,
+        }
     }
 
     /// Is this cursor's referent a member function that is virtual?
     pub fn method_is_virtual(&self) -> bool {
-        unsafe { clang_CXXMethod_isVirtual(self.x) != 0 }
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::CXXMethod_isVirtual(d)
+            },
+            _ => false,
+        }
     }
 
     /// Is this cursor's referent a member function that is pure virtual?
     pub fn method_is_pure_virtual(&self) -> bool {
-        unsafe { clang_CXXMethod_isPureVirtual(self.x) != 0 }
+        match self.node {
+            ASTNode::Decl(d) => unsafe {
+                clang_interface::CXXMethod_isPureVirtual(d)
+            },
+            _ => false,
+        }
     }
 
     /// Is this cursor's referent a struct or class with virtual members?
     pub fn is_virtual_base(&self) -> bool {
-        unsafe { clang_isVirtualBase(self.x) != 0 }
+        match self.node {
+            ASTNode::CXXBaseSpecifier(b) => unsafe {
+                clang_interface::CXXBaseSpecifier_isVirtualBase(b)
+            },
+            _ => false,
+        }
     }
 
     /// Try to evaluate this cursor.
     pub fn evaluate(&self) -> Option<EvalResult> {
-        EvalResult::new(*self)
+        // Work around https://bugs.llvm.org/show_bug.cgi?id=42532, see:
+        //  * https://github.com/rust-lang/rust-bindgen/issues/283
+        //  * https://github.com/rust-lang/rust-bindgen/issues/1590
+        {
+            let mut found_cant_eval = false;
+            self.visit(|c| {
+                if c.kind() == CXCursor_TypeRef
+                    && c.cur_type().canonical_type().kind() == CXType_Unexposed
+                {
+                    found_cant_eval = true;
+                    return CXChildVisit_Break;
+                }
+
+                CXChildVisit_Recurse
+            });
+
+            if found_cant_eval {
+                return None;
+            }
+        }
+        unsafe {
+            let x = match self.node {
+                ASTNode::Decl(d) => {
+                    clang_interface::Decl_Evaluate(d, self.context())
+                }
+                ASTNode::Expr(e) => {
+                    clang_interface::Expr_Evaluate(e, self.context())
+                }
+                _ => return None,
+            };
+            Some(EvalResult { x })
+        }
     }
 
     /// Return the result type for this cursor
     pub fn ret_type(&self) -> Option<Type> {
-        let rt = Type {
-            x: unsafe { clang_getCursorResultType(self.x) },
-        };
-        if rt.is_valid() {
-            Some(rt)
-        } else {
-            None
+        match self.node {
+            ASTNode::Decl(d) => Some(Type {
+                x: unsafe {
+                    clang_interface::Decl_getResultType(d, self.context())
+                },
+                unit: self.unit,
+            }),
+            _ => None,
         }
     }
 
@@ -729,12 +1079,17 @@ impl Cursor {
     ///
     /// Returns None if the cursor does not include a file, otherwise the file's full name
     pub fn get_included_file_name(&self) -> Option<String> {
-        let file = unsafe { clang_sys::clang_getIncludedFile(self.x) };
+        let file = match self.node {
+            ASTNode::PreprocessedEntity(e) => unsafe {
+                clang_interface::PreprocessedEntity_getIncludedFile(e)
+            },
+            _ => ptr::null(),
+        };
         if file.is_null() {
             None
         } else {
             Some(unsafe {
-                cxstring_into_string(clang_sys::clang_getFileName(file))
+                clang_interface::FileEntry_getName(file).to_string()
             })
         }
     }
@@ -743,8 +1098,8 @@ impl Cursor {
 /// A struct that owns the tokenizer result from a given cursor.
 pub struct RawTokens<'a> {
     cursor: &'a Cursor,
-    tu: CXTranslationUnit,
-    tokens: *mut CXToken,
+    tu: *mut clang_interface::clang_ASTUnit,
+    tokens: *mut clang_interface::CXToken,
     token_count: c_uint,
 }
 
@@ -752,9 +1107,11 @@ impl<'a> RawTokens<'a> {
     fn new(cursor: &'a Cursor) -> Self {
         let mut tokens = ptr::null_mut();
         let mut token_count = 0;
+        let tu = cursor.translation_unit();
         let range = cursor.extent();
-        let tu = unsafe { clang_Cursor_getTranslationUnit(cursor.x) };
-        unsafe { clang_tokenize(tu, range, &mut tokens, &mut token_count) };
+        unsafe {
+            clang_interface::tokenize(tu, range, &mut tokens, &mut token_count);
+        }
         Self {
             cursor,
             tu,
@@ -763,7 +1120,7 @@ impl<'a> RawTokens<'a> {
         }
     }
 
-    fn as_slice(&self) -> &[CXToken] {
+    fn as_slice(&self) -> &[clang_interface::CXToken] {
         if self.tokens.is_null() {
             return &[];
         }
@@ -783,7 +1140,7 @@ impl<'a> Drop for RawTokens<'a> {
     fn drop(&mut self) {
         if !self.tokens.is_null() {
             unsafe {
-                clang_disposeTokens(
+                clang_interface::disposeTokens(
                     self.tu,
                     self.tokens,
                     self.token_count as c_uint,
@@ -798,7 +1155,7 @@ impl<'a> Drop for RawTokens<'a> {
 /// string.
 #[derive(Debug)]
 pub struct ClangToken {
-    spelling: CXString,
+    spelling: CString,
     /// The kind of token, this is the same as the relevant member from
     /// `CXToken`.
     pub kind: CXTokenKind,
@@ -807,23 +1164,14 @@ pub struct ClangToken {
 impl ClangToken {
     /// Get the token spelling, without being converted to utf-8.
     pub fn spelling(&self) -> &[u8] {
-        let c_str = unsafe {
-            CStr::from_ptr(clang_getCString(self.spelling) as *const _)
-        };
-        c_str.to_bytes()
-    }
-}
-
-impl Drop for ClangToken {
-    fn drop(&mut self) {
-        unsafe { clang_disposeString(self.spelling) }
+        self.spelling.to_bytes()
     }
 }
 
 /// An iterator over a set of Tokens.
 pub struct ClangTokenIterator<'a> {
-    tu: CXTranslationUnit,
-    raw: slice::Iter<'a, CXToken>,
+    tu: *mut clang_interface::clang_ASTUnit,
+    raw: slice::Iter<'a, clang_interface::CXToken>,
 }
 
 impl<'a> Iterator for ClangTokenIterator<'a> {
@@ -832,8 +1180,9 @@ impl<'a> Iterator for ClangTokenIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let raw = self.raw.next()?;
         unsafe {
-            let kind = clang_getTokenKind(*raw);
-            let spelling = clang_getTokenSpelling(self.tu, *raw);
+            let kind = clang_interface::getTokenKind(*raw);
+            let spelling =
+                clang_interface::getTokenSpelling(self.tu, *raw).to_cstring();
             Some(ClangToken { kind, spelling })
         }
     }
@@ -851,47 +1200,60 @@ pub fn is_valid_identifier(name: &str) -> bool {
     first_valid && chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
-extern "C" fn visit_children<Visitor>(
-    cur: CXCursor,
-    _parent: CXCursor,
-    data: CXClientData,
+unsafe extern "C" fn visit_children<Visitor>(
+    raw_node: clang_interface::Node,
+    _parent: clang_interface::Node,
+    unit: *mut clang_interface::clang_ASTUnit,
+    data: clang_interface::CXClientData,
 ) -> CXChildVisitResult
 where
     Visitor: FnMut(Cursor) -> CXChildVisitResult,
 {
-    let func: &mut Visitor = unsafe { mem::transmute(data) };
-    let child = Cursor { x: cur };
+    let func: &mut Visitor = mem::transmute(data);
+    let node = {
+        // CXCursor_CXXBaseSpecifier must come before decls, because it is in
+        // the range [FirstRef, LastRef]
+        if raw_node.kind == CXCursor_CXXBaseSpecifier {
+            ASTNode::CXXBaseSpecifier(raw_node.ptr.base)
+        } else if (raw_node.kind >= CXCursor_FirstDecl
+            && raw_node.kind <= CXCursor_LastDecl)
+            || (raw_node.kind >= CXCursor_FirstExtraDecl
+                && raw_node.kind <= CXCursor_LastExtraDecl)
+            || (raw_node.kind >= CXCursor_FirstRef
+                && raw_node.kind <= CXCursor_LastRef)
+        {
+            ASTNode::Decl(raw_node.ptr.decl)
+        } else if raw_node.kind >= CXCursor_FirstExpr
+            && raw_node.kind <= CXCursor_LastExpr
+        {
+            ASTNode::Expr(raw_node.ptr.expr)
+        } else if raw_node.kind >= CXCursor_FirstAttr
+            && raw_node.kind <= CXCursor_LastAttr
+        {
+            ASTNode::Attr(raw_node.ptr.attr)
+        } else if raw_node.kind >= CXCursor_FirstPreprocessing
+            && raw_node.kind <= CXCursor_LastPreprocessing
+        {
+            ASTNode::PreprocessedEntity(raw_node.ptr.ppe)
+        } else {
+            return CXChildVisit_Recurse;
+        }
+    };
+    let child = Cursor {
+        node,
+        kind: raw_node.kind,
+        unit,
+    };
 
     (*func)(child)
 }
 
-impl PartialEq for Cursor {
-    fn eq(&self, other: &Cursor) -> bool {
-        unsafe { clang_equalCursors(self.x, other.x) == 1 }
-    }
-}
-
-impl Eq for Cursor {}
-
-impl Hash for Cursor {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        unsafe { clang_hashCursor(self.x) }.hash(state)
-    }
-}
-
 /// The type of a node in clang's AST.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Type {
-    x: CXType,
+    x: clang_interface::BindgenQualType,
+    unit: *mut clang_interface::clang_ASTUnit,
 }
-
-impl PartialEq for Type {
-    fn eq(&self, other: &Self) -> bool {
-        unsafe { clang_equalTypes(self.x, other.x) != 0 }
-    }
-}
-
-impl Eq for Type {}
 
 impl fmt::Debug for Type {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
@@ -927,6 +1289,7 @@ pub enum LayoutError {
 
 impl ::std::convert::From<i32> for LayoutError {
     fn from(val: i32) -> Self {
+        use self::clang_interface::CXTypeLayoutError::*;
         use self::LayoutError::*;
 
         match val {
@@ -941,17 +1304,22 @@ impl ::std::convert::From<i32> for LayoutError {
 }
 
 impl Type {
+    fn context(&self) -> *mut clang_interface::clang_ASTContext {
+        unsafe { clang_interface::ASTUnit_getContext(self.unit) }
+    }
+
     /// Get this type's kind.
     pub fn kind(&self) -> CXTypeKind {
-        self.x.kind
+        unsafe { clang_interface::Type_kind(self.x, self.context()) }
     }
 
     /// Get a cursor pointing to this type's declaration.
     pub fn declaration(&self) -> Cursor {
         unsafe {
-            Cursor {
-                x: clang_getTypeDeclaration(self.x),
-            }
+            Cursor::new(
+                ASTNode::Decl(clang_interface::Type_getDeclaration(self.x)),
+                self.unit,
+            )
         }
     }
 
@@ -983,7 +1351,10 @@ impl Type {
 
     /// Get a raw display name for this type.
     pub fn spelling(&self) -> String {
-        let s = unsafe { cxstring_into_string(clang_getTypeSpelling(self.x)) };
+        let s = unsafe {
+            clang_interface::Type_getTypeSpelling(self.x, self.context())
+                .to_string()
+        };
         // Clang 5.0 introduced changes in the spelling API so it returned the
         // full qualified name. Let's undo that here.
         if s.split("::").all(|s| is_valid_identifier(s)) {
@@ -997,7 +1368,7 @@ impl Type {
 
     /// Is this type const qualified?
     pub fn is_const(&self) -> bool {
-        unsafe { clang_isConstQualifiedType(self.x) != 0 }
+        unsafe { clang_interface::Type_isConstQualifiedType(self.x) }
     }
 
     #[inline]
@@ -1015,7 +1386,9 @@ impl Type {
             }
             // Work-around https://bugs.llvm.org/show_bug.cgi?id=40813
             CXType_Auto if self.is_non_deductible_auto_type() => return -6,
-            _ => unsafe { clang_Type_getSizeOf(self.x) },
+            _ => unsafe {
+                clang_interface::Type_getSizeOf(self.x, self.context())
+            },
         }
     }
 
@@ -1028,7 +1401,9 @@ impl Type {
             }
             // Work-around https://bugs.llvm.org/show_bug.cgi?id=40813
             CXType_Auto if self.is_non_deductible_auto_type() => return -6,
-            _ => unsafe { clang_Type_getAlignOf(self.x) },
+            _ => unsafe {
+                clang_interface::Type_getAlignOf(self.x, self.context())
+            },
         }
     }
 
@@ -1095,14 +1470,8 @@ impl Type {
     /// Get the number of template arguments this type has, or `None` if it is
     /// not some kind of template.
     pub fn num_template_args(&self) -> Option<u32> {
-        // If an old libclang is loaded, we have no hope of answering this
-        // question correctly. However, that's no reason to panic when
-        // generating bindings for simple C headers with an old libclang.
-        if !clang_Type_getNumTemplateArguments::is_loaded() {
-            return None;
-        }
-
-        let n = unsafe { clang_Type_getNumTemplateArguments(self.x) };
+        let n =
+            unsafe { clang_interface::Type_getNumTemplateArguments(self.x) };
         if n >= 0 {
             Some(n as u32)
         } else {
@@ -1116,6 +1485,7 @@ impl Type {
     pub fn template_args(&self) -> Option<TypeTemplateArgIterator> {
         self.num_template_args().map(|n| TypeTemplateArgIterator {
             x: self.x,
+            unit: self.unit,
             length: n,
             index: 0,
         })
@@ -1128,7 +1498,10 @@ impl Type {
         self.num_args().ok().map(|num| {
             (0..num)
                 .map(|i| Type {
-                    x: unsafe { clang_getArgType(self.x, i as c_uint) },
+                    x: unsafe {
+                        clang_interface::Type_getArgType(self.x, i as c_uint)
+                    },
+                    unit: self.unit,
                 })
                 .collect()
         })
@@ -1139,7 +1512,7 @@ impl Type {
     /// Returns Err if the type is not a function prototype.
     pub fn num_args(&self) -> Result<u32, ()> {
         unsafe {
-            let w = clang_getNumArgTypes(self.x);
+            let w = clang_interface::Type_getNumArgTypes(self.x);
             if w == -1 {
                 Err(())
             } else {
@@ -1152,14 +1525,15 @@ impl Type {
     /// to.
     pub fn pointee_type(&self) -> Option<Type> {
         match self.kind() {
-            CXType_Pointer |
-            CXType_RValueReference |
-            CXType_LValueReference |
-            CXType_MemberPointer |
-            CXType_BlockPointer |
-            CXType_ObjCObjectPointer => {
+            CXType_Pointer
+            | CXType_RValueReference
+            | CXType_LValueReference
+            | CXType_MemberPointer
+            | CXType_BlockPointer
+            | CXType_ObjCObjectPointer => {
                 let ret = Type {
-                    x: unsafe { clang_getPointeeType(self.x) },
+                    x: unsafe { clang_interface::Type_getPointeeType(self.x) },
+                    unit: self.unit,
                 };
                 debug_assert!(ret.is_valid());
                 Some(ret)
@@ -1172,7 +1546,8 @@ impl Type {
     /// type of its elements.
     pub fn elem_type(&self) -> Option<Type> {
         let current_type = Type {
-            x: unsafe { clang_getElementType(self.x) },
+            x: unsafe { clang_interface::Type_getElementType(self.x) },
+            unit: self.unit,
         };
         if current_type.is_valid() {
             Some(current_type)
@@ -1184,7 +1559,8 @@ impl Type {
     /// Given that this type is an array or vector type, return its number of
     /// elements.
     pub fn num_elements(&self) -> Option<usize> {
-        let num_elements_returned = unsafe { clang_getNumElements(self.x) };
+        let num_elements_returned =
+            unsafe { clang_interface::Type_getNumElements(self.x) };
         if num_elements_returned != -1 {
             Some(num_elements_returned as usize)
         } else {
@@ -1197,21 +1573,26 @@ impl Type {
     pub fn canonical_type(&self) -> Type {
         unsafe {
             Type {
-                x: clang_getCanonicalType(self.x),
+                x: clang_interface::Type_getCanonicalType(
+                    self.x,
+                    self.context(),
+                ),
+                unit: self.unit,
             }
         }
     }
 
     /// Is this type a variadic function type?
     pub fn is_variadic(&self) -> bool {
-        unsafe { clang_isFunctionTypeVariadic(self.x) != 0 }
+        unsafe { clang_interface::Type_isFunctionTypeVariadic(self.x) }
     }
 
     /// Given that this type is a function type, get the type of its return
     /// value.
     pub fn ret_type(&self) -> Option<Type> {
         let rt = Type {
-            x: unsafe { clang_getResultType(self.x) },
+            x: unsafe { clang_interface::Type_getResultType(self.x) },
+            unit: self.unit,
         };
         if rt.is_valid() {
             Some(rt)
@@ -1222,8 +1603,8 @@ impl Type {
 
     /// Given that this type is a function type, get its calling convention. If
     /// this is not a function type, `CXCallingConv_Invalid` is returned.
-    pub fn call_conv(&self) -> CXCallingConv {
-        unsafe { clang_getFunctionTypeCallingConv(self.x) }
+    pub fn call_conv(&self) -> clang_interface::CXCallingConv::Type {
+        unsafe { clang_interface::Type_getFunctionTypeCallingConv(self.x) }
     }
 
     /// For elaborated types (types which use `class`, `struct`, or `union` to
@@ -1231,11 +1612,8 @@ impl Type {
     pub fn named(&self) -> Type {
         unsafe {
             Type {
-                x: if clang_Type_getNamedType::is_loaded() {
-                    clang_Type_getNamedType(self.x)
-                } else {
-                    self.x
-                },
+                x: clang_interface::Type_getNamedType(self.x),
+                unit: self.unit,
             }
         }
     }
@@ -1255,11 +1633,11 @@ impl Type {
         // Yep, the spelling of this containing type-parameter is extremely
         // nasty... But can happen in <type_traits>. Unfortunately I couldn't
         // reduce it enough :(
-        self.template_args().map_or(false, |args| args.len() > 0) &&
-            match self.declaration().kind() {
-                CXCursor_ClassTemplatePartialSpecialization |
-                CXCursor_TypeAliasTemplateDecl |
-                CXCursor_TemplateTemplateParameter => false,
+        self.template_args().map_or(false, |args| args.len() > 0)
+            && match self.declaration().kind() {
+                CXCursor_ClassTemplatePartialSpecialization
+                | CXCursor_TypeAliasTemplateDecl
+                | CXCursor_TemplateTemplateParameter => false,
                 _ => true,
             }
     }
@@ -1285,9 +1663,9 @@ impl Type {
             ASSOC_TYPE_RE.is_match(spelling.as_ref())
         }
 
-        self.kind() == CXType_Unexposed &&
-            (hacky_parse_associated_type(self.spelling()) ||
-                hacky_parse_associated_type(
+        self.kind() == CXType_Unexposed
+            && (hacky_parse_associated_type(self.spelling())
+                || hacky_parse_associated_type(
                     self.canonical_type().spelling(),
                 ))
     }
@@ -1315,7 +1693,8 @@ impl CanonicalTypeDeclaration {
 
 /// An iterator for a type's template arguments.
 pub struct TypeTemplateArgIterator {
-    x: CXType,
+    x: clang_interface::BindgenQualType,
+    unit: *mut clang_interface::clang_ASTUnit,
     length: u32,
     index: u32,
 }
@@ -1327,7 +1706,10 @@ impl Iterator for TypeTemplateArgIterator {
             let idx = self.index as c_uint;
             self.index += 1;
             Some(Type {
-                x: unsafe { clang_Type_getTemplateArgumentAsType(self.x, idx) },
+                x: unsafe {
+                    clang_interface::Type_getTemplateArgumentAsType(self.x, idx)
+                },
+                unit: self.unit,
             })
         } else {
             None
@@ -1345,7 +1727,8 @@ impl ExactSizeIterator for TypeTemplateArgIterator {
 /// A `SourceLocation` is a file, line, column, and byte offset location for
 /// some source text.
 pub struct SourceLocation {
-    x: CXSourceLocation,
+    x: *mut clang_interface::clang_SourceLocation,
+    unit: *mut clang_interface::clang_ASTUnit,
 }
 
 impl SourceLocation {
@@ -1357,8 +1740,8 @@ impl SourceLocation {
             let mut line = 0;
             let mut col = 0;
             let mut off = 0;
-            clang_getSpellingLocation(
-                self.x, &mut file, &mut line, &mut col, &mut off,
+            clang_interface::getSpellingLocation(
+                self.unit, self.x, &mut file, &mut line, &mut col, &mut off,
             );
             (File { x: file }, line as usize, col as usize, off as usize)
         }
@@ -1376,24 +1759,32 @@ impl fmt::Display for SourceLocation {
     }
 }
 
+impl Drop for SourceLocation {
+    fn drop(&mut self) {
+        unsafe {
+            clang_interface::deleteSourceLocation(self.x);
+        }
+    }
+}
+
 /// A comment in the source text.
 ///
 /// Comments are sort of parsed by Clang, and have a tree structure.
 pub struct Comment {
-    x: CXComment,
+    x: *const clang_interface::clang_comments_Comment,
 }
 
 impl Comment {
     /// What kind of comment is this?
-    pub fn kind(&self) -> CXCommentKind {
-        unsafe { clang_Comment_getKind(self.x) }
+    pub fn kind(&self) -> clang_interface::CXCommentKind::Type {
+        unsafe { clang_interface::Comment_getKind(self.x) }
     }
 
     /// Get this comment's children comment
     pub fn get_children(&self) -> CommentChildrenIterator {
         CommentChildrenIterator {
             parent: self.x,
-            length: unsafe { clang_Comment_getNumChildren(self.x) },
+            length: unsafe { clang_interface::Comment_getNumChildren(self.x) },
             index: 0,
         }
     }
@@ -1401,14 +1792,18 @@ impl Comment {
     /// Given that this comment is the start or end of an HTML tag, get its tag
     /// name.
     pub fn get_tag_name(&self) -> String {
-        unsafe { cxstring_into_string(clang_HTMLTagComment_getTagName(self.x)) }
+        unsafe {
+            clang_interface::HTMLTagComment_getTagName(self.x).to_string()
+        }
     }
 
     /// Given that this comment is an HTML start tag, get its attributes.
     pub fn get_tag_attrs(&self) -> CommentAttributesIterator {
         CommentAttributesIterator {
             x: self.x,
-            length: unsafe { clang_HTMLStartTag_getNumAttrs(self.x) },
+            length: unsafe {
+                clang_interface::HTMLStartTag_getNumAttrs(self.x)
+            },
             index: 0,
         }
     }
@@ -1416,7 +1811,7 @@ impl Comment {
 
 /// An iterator for a comment's children
 pub struct CommentChildrenIterator {
-    parent: CXComment,
+    parent: *const clang_interface::clang_comments_Comment,
     length: c_uint,
     index: c_uint,
 }
@@ -1428,7 +1823,9 @@ impl Iterator for CommentChildrenIterator {
             let idx = self.index;
             self.index += 1;
             Some(Comment {
-                x: unsafe { clang_Comment_getChild(self.parent, idx) },
+                x: unsafe {
+                    clang_interface::Comment_getChild(self.parent, idx)
+                },
             })
         } else {
             None
@@ -1446,7 +1843,7 @@ pub struct CommentAttribute {
 
 /// An iterator for a comment's attributes
 pub struct CommentAttributesIterator {
-    x: CXComment,
+    x: *const clang_interface::clang_comments_Comment,
     length: c_uint,
     index: c_uint,
 }
@@ -1459,14 +1856,12 @@ impl Iterator for CommentAttributesIterator {
             self.index += 1;
             Some(CommentAttribute {
                 name: unsafe {
-                    cxstring_into_string(clang_HTMLStartTag_getAttrName(
-                        self.x, idx,
-                    ))
+                    clang_interface::HTMLStartTag_getAttrName(self.x, idx)
+                        .to_string()
                 },
                 value: unsafe {
-                    cxstring_into_string(clang_HTMLStartTag_getAttrValue(
-                        self.x, idx,
-                    ))
+                    clang_interface::HTMLStartTag_getAttrValue(self.x, idx)
+                        .to_string()
                 },
             })
         } else {
@@ -1477,7 +1872,7 @@ impl Iterator for CommentAttributesIterator {
 
 /// A source file.
 pub struct File {
-    x: CXFile,
+    x: *mut clang_interface::clang_FileEntry,
 }
 
 impl File {
@@ -1486,59 +1881,59 @@ impl File {
         if self.x.is_null() {
             return None;
         }
-        Some(unsafe { cxstring_into_string(clang_getFileName(self.x)) })
+        Some(unsafe { clang_interface::FileEntry_getName(self.x).to_string() })
     }
 }
 
-fn cxstring_to_string_leaky(s: CXString) -> String {
-    if s.data.is_null() {
-        return "".to_owned();
-    }
-    let c_str = unsafe { CStr::from_ptr(clang_getCString(s) as *const _) };
-    c_str.to_string_lossy().into_owned()
-}
+// fn cxstring_to_string_leaky(s: CXString) -> String {
+//     if s.data.is_null() {
+//         return "".to_owned();
+//     }
+//     let c_str = unsafe { CStr::from_ptr(clang_getCString(s) as *const _) };
+//     c_str.to_string_lossy().into_owned()
+// }
 
-fn cxstring_into_string(s: CXString) -> String {
-    let ret = cxstring_to_string_leaky(s);
-    unsafe { clang_disposeString(s) };
-    ret
-}
+// fn cxstring_into_string(s: CXString) -> String {
+//     let ret = cxstring_to_string_leaky(s);
+//     unsafe { clang_disposeString(s) };
+//     ret
+// }
 
-/// An `Index` is an environment for a set of translation units that will
-/// typically end up linked together in one final binary.
-pub struct Index {
-    x: CXIndex,
-}
+// /// An `Index` is an environment for a set of translation units that will
+// /// typically end up linked together in one final binary.
+// pub struct Index {
+//     x: CXIndex,
+// }
 
-impl Index {
-    /// Construct a new `Index`.
-    ///
-    /// The `pch` parameter controls whether declarations in pre-compiled
-    /// headers are included when enumerating a translation unit's "locals".
-    ///
-    /// The `diag` parameter controls whether debugging diagnostics are enabled.
-    pub fn new(pch: bool, diag: bool) -> Index {
-        unsafe {
-            Index {
-                x: clang_createIndex(pch as c_int, diag as c_int),
-            }
-        }
-    }
-}
+// impl Index {
+//     /// Construct a new `Index`.
+//     ///
+//     /// The `pch` parameter controls whether declarations in pre-compiled
+//     /// headers are included when enumerating a translation unit's "locals".
+//     ///
+//     /// The `diag` parameter controls whether debugging diagnostics are enabled.
+//     pub fn new(pch: bool, diag: bool) -> Index {
+//         unsafe {
+//             Index {
+//                 x: clang_createIndex(pch as c_int, diag as c_int),
+//             }
+//         }
+//     }
+// }
 
-impl fmt::Debug for Index {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "Index {{ }}")
-    }
-}
+// impl fmt::Debug for Index {
+//     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+//         write!(fmt, "Index {{ }}")
+//     }
+// }
 
-impl Drop for Index {
-    fn drop(&mut self) {
-        unsafe {
-            clang_disposeIndex(self.x);
-        }
-    }
-}
+// impl Drop for Index {
+//     fn drop(&mut self) {
+//         unsafe {
+//             clang_disposeIndex(self.x);
+//         }
+//     }
+// }
 
 /// A token emitted by clang's lexer.
 #[derive(Debug)]
@@ -1551,7 +1946,7 @@ pub struct Token {
 
 /// A translation unit (or "compilation unit").
 pub struct TranslationUnit {
-    x: CXTranslationUnit,
+    x: *mut clang_interface::clang_ASTUnit,
 }
 
 impl fmt::Debug for TranslationUnit {
@@ -1563,7 +1958,6 @@ impl fmt::Debug for TranslationUnit {
 impl TranslationUnit {
     /// Parse a source file into a translation unit.
     pub fn parse(
-        ix: &Index,
         file: &str,
         cmd_args: &[String],
         unsaved: &[UnsavedFile],
@@ -1576,17 +1970,16 @@ impl TranslationUnit {
             .collect();
         let c_args: Vec<*const c_char> =
             _c_args.iter().map(|s| s.as_ptr()).collect();
-        let mut c_unsaved: Vec<CXUnsavedFile> =
+        let mut c_unsaved: Vec<clang_interface::CXUnsavedFile> =
             unsaved.iter().map(|f| f.x).collect();
         let tu = unsafe {
-            clang_parseTranslationUnit(
-                ix.x,
+            clang_interface::parseTranslationUnit(
                 fname.as_ptr(),
                 c_args.as_ptr(),
                 c_args.len() as c_int,
+                opts,
                 c_unsaved.as_mut_ptr(),
                 c_unsaved.len() as c_uint,
-                opts,
             )
         };
         if tu.is_null() {
@@ -1600,11 +1993,15 @@ impl TranslationUnit {
     /// unit.
     pub fn diags(&self) -> Vec<Diagnostic> {
         unsafe {
-            let num = clang_getNumDiagnostics(self.x) as usize;
+            let num =
+                clang_interface::ASTUnit_getNumDiagnostics(self.x) as usize;
             let mut diags = vec![];
             for i in 0..num {
                 diags.push(Diagnostic {
-                    x: clang_getDiagnostic(self.x, i as c_uint),
+                    x: clang_interface::ASTUnit_getDiagnostic(
+                        self.x,
+                        i as c_uint,
+                    ),
                 });
             }
             diags
@@ -1614,9 +2011,10 @@ impl TranslationUnit {
     /// Get a cursor pointing to the root of this translation unit's AST.
     pub fn cursor(&self) -> Cursor {
         unsafe {
-            Cursor {
-                x: clang_getTranslationUnitCursor(self.x),
-            }
+            Cursor::new(
+                ASTNode::Decl(clang_interface::getTranslationUnitDecl(self.x)),
+                self.x,
+            )
         }
     }
 
@@ -1629,44 +2027,41 @@ impl TranslationUnit {
 impl Drop for TranslationUnit {
     fn drop(&mut self) {
         unsafe {
-            clang_disposeTranslationUnit(self.x);
+            clang_interface::disposeASTUnit(self.x);
         }
     }
 }
 
 /// A diagnostic message generated while parsing a translation unit.
 pub struct Diagnostic {
-    x: CXDiagnostic,
+    x: *const clang_interface::clang_StoredDiagnostic,
 }
 
 impl Diagnostic {
     /// Format this diagnostic message as a string, using the given option bit
     /// flags.
     pub fn format(&self) -> String {
-        unsafe {
-            let opts = clang_defaultDiagnosticDisplayOptions();
-            cxstring_into_string(clang_formatDiagnostic(self.x, opts))
-        }
+        unsafe { clang_interface::Diagnostic_format(self.x).to_string() }
     }
 
     /// What is the severity of this diagnostic message?
-    pub fn severity(&self) -> CXDiagnosticSeverity {
-        unsafe { clang_getDiagnosticSeverity(self.x) }
+    pub fn severity(&self) -> clang_interface::CXDiagnosticSeverity::Type {
+        unsafe { clang_interface::Diagnostic_getSeverity(self.x) }
     }
 }
 
-impl Drop for Diagnostic {
-    /// Destroy this diagnostic message.
-    fn drop(&mut self) {
-        unsafe {
-            clang_disposeDiagnostic(self.x);
-        }
-    }
-}
+// impl Drop for Diagnostic {
+//     /// Destroy this diagnostic message.
+//     fn drop(&mut self) {
+//         unsafe {
+//             clang_interface::Diagnostic_dispose(self.x);
+//         }
+//     }
+// }
 
 /// A file which has not been saved to disk.
 pub struct UnsavedFile {
-    x: CXUnsavedFile,
+    x: clang_interface::CXUnsavedFile,
     /// The name of the unsaved file. Kept here to avoid leaving dangling pointers in
     /// `CXUnsavedFile`.
     pub name: CString,
@@ -1678,7 +2073,7 @@ impl UnsavedFile {
     pub fn new(name: &str, contents: &str) -> UnsavedFile {
         let name = CString::new(name).unwrap();
         let contents = CString::new(contents).unwrap();
-        let x = CXUnsavedFile {
+        let x = clang_interface::CXUnsavedFile {
             Filename: name.as_ptr(),
             Contents: contents.as_ptr(),
             Length: contents.as_bytes().len() as c_ulong,
@@ -1703,12 +2098,12 @@ impl fmt::Debug for UnsavedFile {
 
 /// Convert a cursor kind into a static string.
 pub fn kind_to_str(x: CXCursorKind) -> String {
-    unsafe { cxstring_into_string(clang_getCursorKindSpelling(x)) }
+    unsafe { clang_interface::CursorKind_getSpelling(x).to_string() }
 }
 
 /// Convert a type kind to a static string.
 pub fn type_to_str(x: CXTypeKind) -> String {
-    unsafe { cxstring_into_string(clang_getTypeKindSpelling(x)) }
+    unsafe { clang_interface::TypeKind_getSpelling(x).to_string() }
 }
 
 /// Dump the Clang AST to stdout for debugging purposes.
@@ -1854,11 +2249,7 @@ pub fn ast_dump(c: &Cursor, depth: isize) -> CXChildVisitResult {
             format!(" {}spelling = \"{}\"", prefix, ty.spelling()),
         );
         let num_template_args =
-            if clang_Type_getNumTemplateArguments::is_loaded() {
-                unsafe { clang_Type_getNumTemplateArguments(ty.x) }
-            } else {
-                -1
-            };
+            unsafe { clang_interface::Type_getNumTemplateArguments(ty.x) };
         if num_template_args >= 0 {
             print_indent(
                 depth,
@@ -1943,56 +2334,33 @@ pub fn ast_dump(c: &Cursor, depth: isize) -> CXChildVisitResult {
 
 /// Try to extract the clang version to a string
 pub fn extract_clang_version() -> String {
-    unsafe { cxstring_into_string(clang_getClangVersion()) }
+    let version = unsafe { clang_interface::getClangVersion() };
+    version.to_string()
 }
 
 /// A wrapper for the result of evaluating an expression.
 #[derive(Debug)]
 pub struct EvalResult {
-    x: CXEvalResult,
+    x: *mut clang_interface::EvalResult,
+}
+
+impl Drop for EvalResult {
+    fn drop(&mut self) {
+        unsafe { clang_interface::deleteEvalResult(self.x); }
+    }
 }
 
 impl EvalResult {
-    /// Evaluate `cursor` and return the result.
-    pub fn new(cursor: Cursor) -> Option<Self> {
-        if !clang_Cursor_Evaluate::is_loaded() {
-            return None;
-        }
-
-        // Work around https://bugs.llvm.org/show_bug.cgi?id=42532, see:
-        //  * https://github.com/rust-lang/rust-bindgen/issues/283
-        //  * https://github.com/rust-lang/rust-bindgen/issues/1590
-        {
-            let mut found_cant_eval = false;
-            cursor.visit(|c| {
-                if c.kind() == CXCursor_TypeRef &&
-                    c.cur_type().canonical_type().kind() == CXType_Unexposed
-                {
-                    found_cant_eval = true;
-                    return CXChildVisit_Break;
-                }
-
-                CXChildVisit_Recurse
-            });
-
-            if found_cant_eval {
-                return None;
-            }
-        }
-        Some(EvalResult {
-            x: unsafe { clang_Cursor_Evaluate(cursor.x) },
-        })
-    }
-
     fn kind(&self) -> CXEvalResultKind {
-        unsafe { clang_EvalResult_getKind(self.x) }
+        unsafe { clang_interface::EvalResult_getKind(self.x) }
     }
 
     /// Try to get back the result as a double.
     pub fn as_double(&self) -> Option<f64> {
         match self.kind() {
             CXEval_Float => {
-                Some(unsafe { clang_EvalResult_getAsDouble(self.x) } as f64)
+                Some(unsafe { clang_interface::EvalResult_getAsDouble(self.x) }
+                    as f64)
             }
             _ => None,
         }
@@ -2004,14 +2372,9 @@ impl EvalResult {
             return None;
         }
 
-        if !clang_EvalResult_isUnsignedInt::is_loaded() {
-            // FIXME(emilio): There's no way to detect underflow here, and clang
-            // will just happily give us a value.
-            return Some(unsafe { clang_EvalResult_getAsInt(self.x) } as i64);
-        }
-
-        if unsafe { clang_EvalResult_isUnsignedInt(self.x) } != 0 {
-            let value = unsafe { clang_EvalResult_getAsUnsigned(self.x) };
+        if unsafe { clang_interface::EvalResult_isUnsignedInt(self.x) } {
+            let value =
+                unsafe { clang_interface::EvalResult_getAsUnsigned(self.x) };
             if value > i64::max_value() as c_ulonglong {
                 return None;
             }
@@ -2019,7 +2382,8 @@ impl EvalResult {
             return Some(value as i64);
         }
 
-        let value = unsafe { clang_EvalResult_getAsLongLong(self.x) };
+        let value =
+            unsafe { clang_interface::EvalResult_getAsLongLong(self.x) };
         if value > i64::max_value() as c_longlong {
             return None;
         }
@@ -2034,9 +2398,8 @@ impl EvalResult {
     pub fn as_literal_string(&self) -> Option<Vec<u8>> {
         match self.kind() {
             CXEval_StrLiteral => {
-                let ret = unsafe {
-                    CStr::from_ptr(clang_EvalResult_getAsStr(self.x))
-                };
+                let mut stringref = unsafe { clang_interface::EvalResult_getAsStr(self.x) };
+                let ret = unsafe { CStr::from_ptr(clang_interface::cString(&mut stringref)) };
                 Some(ret.to_bytes().to_vec())
             }
             _ => None,
@@ -2044,11 +2407,11 @@ impl EvalResult {
     }
 }
 
-impl Drop for EvalResult {
-    fn drop(&mut self) {
-        unsafe { clang_EvalResult_dispose(self.x) };
-    }
-}
+// impl Drop for EvalResult {
+//     fn drop(&mut self) {
+//         unsafe { clang_interface::EvalResult_dispose(self.x) };
+//     }
+// }
 
 /// Target information obtained from libclang.
 #[derive(Debug)]
@@ -2062,16 +2425,12 @@ pub struct TargetInfo {
 impl TargetInfo {
     /// Tries to obtain target information from libclang.
     pub fn new(tu: &TranslationUnit) -> Option<Self> {
-        if !clang_getTranslationUnitTargetInfo::is_loaded() {
-            return None;
-        }
         let triple;
         let pointer_width;
         unsafe {
-            let ti = clang_getTranslationUnitTargetInfo(tu.x);
-            triple = cxstring_into_string(clang_TargetInfo_getTriple(ti));
-            pointer_width = clang_TargetInfo_getPointerWidth(ti);
-            clang_TargetInfo_dispose(ti);
+            let ti = clang_interface::ASTUnit_getTargetInfo(tu.x);
+            triple = clang_interface::TargetInfo_getTriple(ti).to_string();
+            pointer_width = clang_interface::TargetInfo_getPointerWidth(ti);
         }
         assert!(pointer_width > 0);
         assert_eq!(pointer_width % 8, 0);
