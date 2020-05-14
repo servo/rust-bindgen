@@ -17,23 +17,13 @@
 
 #[macro_use]
 extern crate bitflags;
-extern crate cexpr;
 #[macro_use]
 #[allow(unused_extern_crates)]
 extern crate cfg_if;
-extern crate clang_sys;
-extern crate lazycell;
-extern crate rustc_hash;
 #[macro_use]
 extern crate lazy_static;
-extern crate peeking_take_while;
 #[macro_use]
 extern crate quote;
-extern crate proc_macro2;
-extern crate regex;
-extern crate shlex;
-#[cfg(feature = "which-rustfmt")]
-extern crate which;
 
 #[cfg(feature = "logging")]
 #[macro_use]
@@ -82,13 +72,15 @@ doc_mod!(ir, ir_docs);
 doc_mod!(parse, parse_docs);
 doc_mod!(regex_set, regex_set_docs);
 
-pub use codegen::{AliasVariation, EnumVariation};
-use features::RustFeatures;
-pub use features::{RustTarget, LATEST_STABLE_RUST, RUST_TARGET_STRINGS};
-use ir::context::{BindgenContext, ItemId};
-use ir::item::Item;
-use parse::{ClangItemParser, ParseError};
-use regex_set::RegexSet;
+pub use crate::codegen::{AliasVariation, EnumVariation};
+use crate::features::RustFeatures;
+pub use crate::features::{
+    RustTarget, LATEST_STABLE_RUST, RUST_TARGET_STRINGS,
+};
+use crate::ir::context::{BindgenContext, ItemId};
+use crate::ir::item::Item;
+use crate::parse::{ClangItemParser, ParseError};
+use crate::regex_set::RegexSet;
 
 use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
@@ -712,14 +704,21 @@ impl Builder {
         self
     }
 
-    /// Whether the generated bindings should contain documentation comments or
-    /// not.
+    /// Whether the generated bindings should contain documentation comments
+    /// (docstrings) or not.
     ///
     /// This ideally will always be true, but it may need to be false until we
     /// implement some processing on comments to work around issues as described
-    /// in:
+    /// in [rust-bindgen issue
+    /// #426](https://github.com/rust-lang/rust-bindgen/issues/426).
     ///
-    /// https://github.com/rust-lang/rust-bindgen/issues/426
+    /// Note that clang by default excludes comments from system headers, pass
+    /// `-fretain-comments-from-system-headers` as
+    /// [`clang_arg`][Builder::clang_arg] to include them. It can also be told
+    /// to process all comments (not just documentation ones) using the
+    /// `-fparse-all-comments` flag. See [slides on clang comment parsing](
+    /// https://llvm.org/devmtg/2012-11/Gribenko_CommentParsing.pdf) for
+    /// background and examples.
     pub fn generate_comments(mut self, doit: bool) -> Self {
         self.options.generate_comments = doit;
         self
@@ -939,9 +938,9 @@ impl Builder {
     /// This makes bindgen generate enums instead of constants. Regular
     /// expressions are supported.
     ///
-    /// **Use this with caution,** you probably want to use the non_exhaustive
-    /// flavor of rust enums instead of this one. Take a look at
-    /// https://github.com/rust-lang/rust/issues/36927 for more information.
+    /// **Use this with caution**, creating this in unsafe code
+    /// (including FFI) with an invalid value will invoke undefined behaviour.
+    /// You may want to use the newtype enum style instead.
     pub fn rustified_enum<T: AsRef<str>>(mut self, arg: T) -> Builder {
         self.options.rustified_enums.insert(arg);
         self
@@ -952,6 +951,10 @@ impl Builder {
     ///
     /// This makes bindgen generate enums instead of constants. Regular
     /// expressions are supported.
+    ///
+    /// **Use this with caution**, creating this in unsafe code
+    /// (including FFI) with an invalid value will invoke undefined behaviour.
+    /// You may want to use the newtype enum style instead.
     pub fn rustified_non_exhaustive_enum<T: AsRef<str>>(
         mut self,
         arg: T,
@@ -2399,7 +2402,7 @@ impl callbacks::ParseCallbacks for CargoCallbacks {
 #[test]
 fn commandline_flag_unit_test_function() {
     //Test 1
-    let bindings = ::builder();
+    let bindings = crate::builder();
     let command_line_flags = bindings.command_line_flags();
 
     let test_cases = vec![
@@ -2417,7 +2420,7 @@ fn commandline_flag_unit_test_function() {
         .all(|ref x| command_line_flags.contains(x),));
 
     //Test 2
-    let bindings = ::builder()
+    let bindings = crate::builder()
         .header("input_header")
         .whitelist_type("Distinct_Type")
         .whitelist_function("safe_function");
