@@ -223,7 +223,8 @@ where
     T: Copy + Into<ItemId>,
 {
     fn can_derive_default(&self, ctx: &BindgenContext) -> bool {
-        ctx.options().derive_default && ctx.lookup_can_derive_default(*self)
+        ctx.options().derive_default &&
+            ctx.lookup_can_derive_default(*self) == CanDerive::Yes
     }
 }
 
@@ -401,11 +402,12 @@ pub struct BindgenContext {
     /// and is always `None` before that and `Some` after.
     cannot_derive_debug: Option<HashSet<ItemId>>,
 
-    /// The set of (`ItemId`s of) types that can't derive default.
+    /// Map from type `ItemId`s to why they can't derive hash. If an id is not
+    /// in this map, we can assume that its value would be `CanDerive::Yes`.
     ///
     /// This is populated when we enter codegen by `compute_cannot_derive_default`
     /// and is always `None` before that and `Some` after.
-    cannot_derive_default: Option<HashSet<ItemId>>,
+    cannot_derive_default: Option<HashMap<ItemId, CanDerive>>,
 
     /// The set of (`ItemId`s of) types that can't derive copy.
     ///
@@ -2465,16 +2467,16 @@ If you encounter an error missing from this list, please file an issue or a PR!"
         assert!(self.cannot_derive_default.is_none());
         if self.options.derive_default {
             self.cannot_derive_default =
-                Some(as_cannot_derive_set(analyze::<CannotDerive>((
-                    self,
-                    DeriveTrait::Default,
-                ))));
+                Some(analyze::<CannotDerive>((self, DeriveTrait::Default)));
         }
     }
 
     /// Look up whether the item with `id` can
     /// derive default or not.
-    pub fn lookup_can_derive_default<Id: Into<ItemId>>(&self, id: Id) -> bool {
+    pub fn lookup_can_derive_default<Id: Into<ItemId>>(
+        &self,
+        id: Id,
+    ) -> CanDerive {
         let id = id.into();
         assert!(
             self.in_codegen_phase(),
@@ -2483,7 +2485,12 @@ If you encounter an error missing from this list, please file an issue or a PR!"
 
         // Look up the computed value for whether the item with `id` can
         // derive default or not.
-        !self.cannot_derive_default.as_ref().unwrap().contains(&id)
+        self.cannot_derive_default
+            .as_ref()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or(CanDerive::Yes)
     }
 
     /// Compute whether we can derive copy.
@@ -2639,6 +2646,12 @@ If you encounter an error missing from this list, please file an issue or a PR!"
     pub fn no_hash_by_name(&self, item: &Item) -> bool {
         let name = item.path_for_whitelisting(self)[1..].join("::");
         self.options().no_hash_types.matches(&name)
+    }
+
+    /// Check if `--no-default` flag is enabled for this item.
+    pub fn no_default_by_name(&self, item: &Item) -> bool {
+        let name = item.path_for_whitelisting(self)[1..].join("::");
+        self.options().no_default_types.matches(&name)
     }
 }
 
