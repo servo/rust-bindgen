@@ -13,7 +13,7 @@ mod bitfield_unit_tests;
 use self::helpers::attributes;
 use self::struct_layout::StructLayoutTracker;
 
-use super::BindgenOptions;
+use super::{BindgenOptions, LayoutTests};
 
 use crate::ir::analysis::{HasVtable, Sizedness};
 use crate::ir::annotations::FieldAccessorKind;
@@ -185,6 +185,12 @@ impl From<DerivableTraits> for Vec<&'static str> {
 struct CodegenResult<'a> {
     items: Vec<proc_macro2::TokenStream>,
 
+    /// Just the layout tests.
+    ///
+    /// Used to implement `LayoutTests::EmitOnly`, and empty if that setting is
+    /// disabled (note that conversely `items` is always populted).
+    only_tests: Vec<proc_macro2::TokenStream>,
+
     /// A monotonic counter used to add stable unique id's to stuff that doesn't
     /// need to be referenced by anything.
     codegen_id: &'a Cell<usize>,
@@ -234,6 +240,7 @@ impl<'a> CodegenResult<'a> {
     fn new(codegen_id: &'a Cell<usize>) -> Self {
         CodegenResult {
             items: vec![],
+            only_tests: vec![],
             saw_bindgen_union: false,
             saw_incomplete_array: false,
             saw_objc: false,
@@ -301,7 +308,10 @@ impl<'a> CodegenResult<'a> {
         self.vars_seen.insert(name.into());
     }
 
-    fn inner<F>(&mut self, cb: F) -> Vec<proc_macro2::TokenStream>
+    fn inner<F>(
+        &mut self,
+        cb: F,
+    ) -> (Vec<proc_macro2::TokenStream>, Vec<proc_macro2::TokenStream>)
     where
         F: FnOnce(&mut Self),
     {
@@ -315,7 +325,7 @@ impl<'a> CodegenResult<'a> {
         self.saw_bitfield_unit |= new.saw_bitfield_unit;
         self.saw_bindgen_union |= new.saw_bindgen_union;
 
-        new.items
+        (new.items, new.only_tests)
     }
 }
 
@@ -522,7 +532,7 @@ impl CodeGenerator for Module {
         }
 
         let mut found_any = false;
-        let inner_items = result.inner(|result| {
+        let (inner_items, inner_tests) = result.inner(|result| {
             result.push(root_import(ctx, item));
 
             let path = item.namespace_aware_canonical_path(ctx).join("::");
@@ -544,7 +554,7 @@ impl CodeGenerator for Module {
         }
 
         let name = item.canonical_name(ctx);
-        let ident = ctx.rust_ident(name);
+        let ident = ctx.rust_ident(&name);
         result.push(if item.id() == ctx.root_module() {
             quote! {
                 #[allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
@@ -559,6 +569,19 @@ impl CodeGenerator for Module {
                 }
             }
         });
+        if ctx.options().layout_tests == LayoutTests::EmitOnly &&
+            !result.only_tests.is_empty()
+        {
+            // XXX the following appears to work? Or should this just be unsupported.
+            let test_mod =
+                ctx.rust_ident(format!("__bindgen_test_mod_{}", name));
+            result.only_tests.push(quote! {
+                mod #test_mod {
+                    use super::#ident::*;
+                    #( #inner_tests )*
+                }
+            });
+        }
     }
 }
 
@@ -1055,7 +1078,7 @@ impl CodeGenerator for TemplateInstantiation {
         // instantiation is opaque, then its presumably because we don't
         // properly understand it (maybe because of specializations), and so we
         // shouldn't emit layout tests either.
-        if !ctx.options().layout_tests || self.is_opaque(ctx, item) {
+        if !ctx.options().layout_tests.needed() || self.is_opaque(ctx, item) {
             return;
         }
 
@@ -1102,7 +1125,9 @@ impl CodeGenerator for TemplateInstantiation {
                                        stringify!(#ident)));
                 }
             };
-
+            if ctx.options().layout_tests == LayoutTests::EmitOnly {
+                result.only_tests.push(item.clone());
+            }
             result.push(item);
         }
     }
@@ -1964,7 +1989,9 @@ impl CodeGenerator for CompInfo {
                 }
             }
 
-            if ctx.options().layout_tests && !self.is_forward_declaration() {
+            if ctx.options().layout_tests.needed() &&
+                !self.is_forward_declaration()
+            {
                 if let Some(layout) = layout {
                     let fn_name =
                         format!("bindgen_test_layout_{}", canonical_ident);
@@ -2047,6 +2074,9 @@ impl CodeGenerator for CompInfo {
                             #( #check_field_offset )*
                         }
                     };
+                    if ctx.options().layout_tests == LayoutTests::EmitOnly {
+                        result.only_tests.push(item.clone());
+                    }
                     result.push(item);
                 }
             }
@@ -4074,8 +4104,11 @@ pub(crate) fn codegen(
             &mut result,
             &(),
         );
-
-        result.items
+        if LayoutTests::EmitOnly == context.options().layout_tests {
+            result.only_tests
+        } else {
+            result.items
+        }
     })
 }
 
