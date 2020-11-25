@@ -2,6 +2,7 @@ mod error;
 mod helpers;
 mod impl_debug;
 mod impl_partialeq;
+mod methods;
 pub mod struct_layout;
 
 #[cfg(test)]
@@ -20,7 +21,7 @@ use crate::ir::annotations::FieldAccessorKind;
 use crate::ir::comment;
 use crate::ir::comp::{
     Base, Bitfield, BitfieldUnit, CompInfo, CompKind, Field, FieldData,
-    FieldMethods, Method, MethodKind,
+    FieldMethods, Method,
 };
 use crate::ir::context::{BindgenContext, ItemId};
 use crate::ir::derive::{
@@ -42,7 +43,7 @@ use crate::ir::template::{
 use crate::ir::ty::{Type, TypeKind};
 use crate::ir::var::Var;
 
-use proc_macro2::{self, Ident, Span};
+use proc_macro2::{self, Ident, Span, TokenStream};
 use quote::TokenStreamExt;
 
 use crate::{Entry, HashMap, HashSet};
@@ -182,7 +183,7 @@ impl From<DerivableTraits> for Vec<&'static str> {
     }
 }
 
-struct CodegenResult<'a> {
+pub struct CodegenResult<'a> {
     items: Vec<proc_macro2::TokenStream>,
 
     /// A monotonic counter used to add stable unique id's to stuff that doesn't
@@ -1622,6 +1623,60 @@ impl<'a> FieldCodegen<'a> for Bitfield {
     }
 }
 
+impl CompInfo {
+    /// This function writes the Box_Typename stuff into result
+    pub fn create_safe_class_interface<'a>(
+        &self,
+        ctx: &BindgenContext,
+        result: &mut CodegenResult<'a>,
+        ty_for_impl: TokenStream,
+        layout: Layout
+    ) {
+        let prefix = ctx.trait_prefix();
+
+        let boxname = Ident::new(&format!("Box_{}", ty_for_impl), Span::call_site());
+        result.push(quote!(
+            struct #boxname {
+                ptr: *mut ::#prefix::ffi::c_void
+            }
+        ));
+        let mut methods: Vec<proc_macro2::TokenStream> = vec![];
+        self.codegen_methods(ctx, result, &ty_for_impl, Some(layout), &mut methods, true);
+        result.push(quote! (
+            impl #boxname {
+                #( #methods )*
+            }
+        ));
+
+        let size = layout.size;
+        let align = layout.align;
+        assert!(size != 0, "alloc is undefined if size == 0");
+        if let Some(destructor) = self.destructor() {
+            let destructorname = destructor.1.get_function_name(ctx);
+            result.push(quote! {
+                impl Drop for #boxname {
+                    fn drop(&mut self) {
+                        unsafe {
+                            #destructorname(self.ptr as *mut #ty_for_impl);
+                            ::#prefix::alloc::dealloc(self.ptr as *mut u8,::#prefix::alloc::Layout::from_size_align(#size, #align).unwrap());
+                        }
+                    }
+                }
+            });
+        } else {
+            result.push(quote! {
+                impl Drop for #boxname {
+                    fn drop(&mut self) {
+                        unsafe {
+                            ::#prefix::alloc::dealloc(self.ptr as *mut u8,::#prefix::alloc::Layout::from_size_align(#size, #align).unwrap());
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
 impl CodeGenerator for CompInfo {
     type Extra = Item;
 
@@ -1957,6 +2012,12 @@ impl CodeGenerator for CompInfo {
             );
         }
 
+        // NB: We can't use to_rust_ty here since for opaque types this tries to
+        // use the specialization knowledge to generate a blob field.
+        let ty_for_impl = quote! {
+            #canonical_ident #generics
+        };
+
         if all_template_params.is_empty() {
             if !is_opaque {
                 for var in self.inner_vars() {
@@ -2051,57 +2112,8 @@ impl CodeGenerator for CompInfo {
                 }
             }
 
-            let mut method_names = Default::default();
-            if ctx.options().codegen_config.methods() {
-                for method in self.methods() {
-                    assert!(method.kind() != MethodKind::Constructor);
-                    method.codegen_method(
-                        ctx,
-                        &mut methods,
-                        &mut method_names,
-                        result,
-                        self,
-                    );
-                }
-            }
-
-            if ctx.options().codegen_config.constructors() {
-                for sig in self.constructors() {
-                    Method::new(
-                        MethodKind::Constructor,
-                        *sig,
-                        /* const */
-                        false,
-                    )
-                    .codegen_method(
-                        ctx,
-                        &mut methods,
-                        &mut method_names,
-                        result,
-                        self,
-                    );
-                }
-            }
-
-            if ctx.options().codegen_config.destructors() {
-                if let Some((kind, destructor)) = self.destructor() {
-                    debug_assert!(kind.is_destructor());
-                    Method::new(kind, destructor, false).codegen_method(
-                        ctx,
-                        &mut methods,
-                        &mut method_names,
-                        result,
-                        self,
-                    );
-                }
-            }
+            self.codegen_methods(ctx, result, &ty_for_impl, layout, &mut methods, false);
         }
-
-        // NB: We can't use to_rust_ty here since for opaque types this tries to
-        // use the specialization knowledge to generate a blob field.
-        let ty_for_impl = quote! {
-            #canonical_ident #generics
-        };
 
         if needs_clone_impl {
             result.push(quote! {
@@ -2169,185 +2181,9 @@ impl CodeGenerator for CompInfo {
                 }
             });
         }
-    }
-}
-
-trait MethodCodegen {
-    fn codegen_method<'a>(
-        &self,
-        ctx: &BindgenContext,
-        methods: &mut Vec<proc_macro2::TokenStream>,
-        method_names: &mut HashMap<String, usize>,
-        result: &mut CodegenResult<'a>,
-        parent: &CompInfo,
-    );
-}
-
-impl MethodCodegen for Method {
-    fn codegen_method<'a>(
-        &self,
-        ctx: &BindgenContext,
-        methods: &mut Vec<proc_macro2::TokenStream>,
-        method_names: &mut HashMap<String, usize>,
-        result: &mut CodegenResult<'a>,
-        _parent: &CompInfo,
-    ) {
-        assert!({
-            let cc = &ctx.options().codegen_config;
-            match self.kind() {
-                MethodKind::Constructor => cc.constructors(),
-                MethodKind::Destructor => cc.destructors(),
-                MethodKind::VirtualDestructor { .. } => cc.destructors(),
-                MethodKind::Static |
-                MethodKind::Normal |
-                MethodKind::Virtual { .. } => cc.methods(),
-            }
-        });
-
-        // TODO(emilio): We could generate final stuff at least.
-        if self.is_virtual() {
-            return; // FIXME
+        if let Some(layout) = layout {
+            self.create_safe_class_interface(ctx, result, ty_for_impl, layout);
         }
-
-        // First of all, output the actual function.
-        let function_item = ctx.resolve_item(self.signature());
-        if function_item.is_blacklisted(ctx) {
-            // We shouldn't emit a method declaration if the function is blacklisted
-            return;
-        }
-        function_item.codegen(ctx, result, &());
-
-        let function = function_item.expect_function();
-        let signature_item = ctx.resolve_item(function.signature());
-        let mut name = match self.kind() {
-            MethodKind::Constructor => "new".into(),
-            MethodKind::Destructor => "destruct".into(),
-            _ => function.name().to_owned(),
-        };
-
-        let signature = match *signature_item.expect_type().kind() {
-            TypeKind::Function(ref sig) => sig,
-            _ => panic!("How in the world?"),
-        };
-
-        if let (Abi::ThisCall, false) =
-            (signature.abi(), ctx.options().rust_features().thiscall_abi)
-        {
-            return;
-        }
-
-        // Do not generate variadic methods, since rust does not allow
-        // implementing them, and we don't do a good job at it anyway.
-        if signature.is_variadic() {
-            return;
-        }
-
-        let count = {
-            let count = method_names.entry(name.clone()).or_insert(0);
-            *count += 1;
-            *count - 1
-        };
-
-        if count != 0 {
-            name.push_str(&count.to_string());
-        }
-
-        let function_name = ctx.rust_ident(function_item.canonical_name(ctx));
-        let mut args = utils::fnsig_arguments(ctx, signature);
-        let mut ret = utils::fnsig_return_ty(ctx, signature);
-
-        if !self.is_static() && !self.is_constructor() {
-            args[0] = if self.is_const() {
-                quote! { &self }
-            } else {
-                quote! { &mut self }
-            };
-        }
-
-        // If it's a constructor, we always return `Self`, and we inject the
-        // "this" parameter, so there's no need to ask the user for it.
-        //
-        // Note that constructors in Clang are represented as functions with
-        // return-type = void.
-        if self.is_constructor() {
-            args.remove(0);
-            ret = quote! { -> Self };
-        }
-
-        let mut exprs =
-            helpers::ast_ty::arguments_from_signature(&signature, ctx);
-
-        let mut stmts = vec![];
-
-        // If it's a constructor, we need to insert an extra parameter with a
-        // variable called `__bindgen_tmp` we're going to create.
-        if self.is_constructor() {
-            let prefix = ctx.trait_prefix();
-            let tmp_variable_decl = if ctx
-                .options()
-                .rust_features()
-                .maybe_uninit
-            {
-                exprs[0] = quote! {
-                    __bindgen_tmp.as_mut_ptr()
-                };
-                quote! {
-                    let mut __bindgen_tmp = ::#prefix::mem::MaybeUninit::uninit()
-                }
-            } else {
-                exprs[0] = quote! {
-                    &mut __bindgen_tmp
-                };
-                quote! {
-                    let mut __bindgen_tmp = ::#prefix::mem::uninitialized()
-                }
-            };
-            stmts.push(tmp_variable_decl);
-        } else if !self.is_static() {
-            assert!(!exprs.is_empty());
-            exprs[0] = quote! {
-                self
-            };
-        };
-
-        let call = quote! {
-            #function_name (#( #exprs ),* )
-        };
-
-        stmts.push(call);
-
-        if self.is_constructor() {
-            stmts.push(if ctx.options().rust_features().maybe_uninit {
-                quote! {
-                    __bindgen_tmp.assume_init()
-                }
-            } else {
-                quote! {
-                    __bindgen_tmp
-                }
-            })
-        }
-
-        let block = quote! {
-            #( #stmts );*
-        };
-
-        let mut attrs = vec![];
-        attrs.push(attributes::inline());
-
-        if signature.must_use() &&
-            ctx.options().rust_features().must_use_function
-        {
-            attrs.push(attributes::must_use());
-        }
-
-        let name = ctx.rust_ident(&name);
-        methods.push(quote! {
-            #(#attrs)*
-            pub unsafe fn #name ( #( #args ),* ) #ret {
-                #block
-            }
-        });
     }
 }
 
@@ -4411,55 +4247,60 @@ mod utils {
         }
     }
 
+    pub fn argument_type_id_to_rust_type(
+        ctx: &BindgenContext,
+        ty: crate::ir::context::TypeId,
+    ) -> proc_macro2::TokenStream {
+        use super::ToPtr;
+
+        let arg_item = ctx.resolve_item(ty);
+        let arg_ty = arg_item.kind().expect_type();
+
+        // From the C90 standard[1]:
+        //
+        //     A declaration of a parameter as "array of type" shall be
+        //     adjusted to "qualified pointer to type", where the type
+        //     qualifiers (if any) are those specified within the [ and ] of
+        //     the array type derivation.
+        //
+        // [1]: http://c0x.coding-guidelines.com/6.7.5.3.html
+        match *arg_ty.canonical_type(ctx).kind() {
+            TypeKind::Array(t, _) => {
+                let stream = if ctx.options().array_pointers_in_arguments {
+                    arg_ty.to_rust_ty_or_opaque(ctx, &arg_item)
+                } else {
+                    t.to_rust_ty_or_opaque(ctx, &())
+                };
+                stream.to_ptr(ctx.resolve_type(t).is_const())
+            }
+            TypeKind::Pointer(inner) => {
+                let inner = ctx.resolve_item(inner);
+                let inner_ty = inner.expect_type();
+                if let TypeKind::ObjCInterface(ref interface) =
+                    *inner_ty.canonical_type(ctx).kind()
+                {
+                    let name = ctx.rust_ident(interface.name());
+                    quote! {
+                        #name
+                    }
+                } else {
+                    arg_item.to_rust_ty_or_opaque(ctx, &())
+                }
+            }
+            _ => arg_item.to_rust_ty_or_opaque(ctx, &()),
+        }
+    }
+
+    /// Returns a Vec of the Rust arguments of the function sig
     pub fn fnsig_arguments(
         ctx: &BindgenContext,
         sig: &FunctionSig,
     ) -> Vec<proc_macro2::TokenStream> {
-        use super::ToPtr;
-
         let mut unnamed_arguments = 0;
         let mut args = sig
             .argument_types()
             .iter()
             .map(|&(ref name, ty)| {
-                let arg_item = ctx.resolve_item(ty);
-                let arg_ty = arg_item.kind().expect_type();
-
-                // From the C90 standard[1]:
-                //
-                //     A declaration of a parameter as "array of type" shall be
-                //     adjusted to "qualified pointer to type", where the type
-                //     qualifiers (if any) are those specified within the [ and ] of
-                //     the array type derivation.
-                //
-                // [1]: http://c0x.coding-guidelines.com/6.7.5.3.html
-                let arg_ty = match *arg_ty.canonical_type(ctx).kind() {
-                    TypeKind::Array(t, _) => {
-                        let stream =
-                            if ctx.options().array_pointers_in_arguments {
-                                arg_ty.to_rust_ty_or_opaque(ctx, &arg_item)
-                            } else {
-                                t.to_rust_ty_or_opaque(ctx, &())
-                            };
-                        stream.to_ptr(ctx.resolve_type(t).is_const())
-                    }
-                    TypeKind::Pointer(inner) => {
-                        let inner = ctx.resolve_item(inner);
-                        let inner_ty = inner.expect_type();
-                        if let TypeKind::ObjCInterface(ref interface) =
-                            *inner_ty.canonical_type(ctx).kind()
-                        {
-                            let name = ctx.rust_ident(interface.name());
-                            quote! {
-                                #name
-                            }
-                        } else {
-                            arg_item.to_rust_ty_or_opaque(ctx, &())
-                        }
-                    }
-                    _ => arg_item.to_rust_ty_or_opaque(ctx, &()),
-                };
-
                 let arg_name = match *name {
                     Some(ref name) => ctx.rust_mangle(name).into_owned(),
                     None => {
@@ -4470,6 +4311,8 @@ mod utils {
 
                 assert!(!arg_name.is_empty());
                 let arg_name = ctx.rust_ident(arg_name);
+
+                let arg_ty = argument_type_id_to_rust_type(ctx, ty);
 
                 quote! {
                     #arg_name : #arg_ty

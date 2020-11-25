@@ -13,7 +13,7 @@ use super::derive::{
 };
 use super::function::Function;
 use super::int::IntKind;
-use super::item::{IsOpaque, Item, ItemAncestors, ItemSet};
+use super::item::{IsOpaque, Item, ItemAncestors, ItemSet, ItemCanonicalName};
 use super::item_kind::ItemKind;
 use super::module::{Module, ModuleKind};
 use super::template::{TemplateInstantiation, TemplateParameters};
@@ -184,6 +184,13 @@ item_id_newtype! {
         /// Convert this `ItemId` into a `FunctionId` without actually checking whether
         /// this id actually points to a `Function`.
         unchecked = as_function_id_unchecked;
+}
+
+impl FunctionId {
+    pub fn get_function_name(&self, ctx: &BindgenContext) -> proc_macro2::Ident {
+        let function_item = ctx.resolve_item(self);
+        ctx.rust_ident(function_item.canonical_name(ctx))
+    }
 }
 
 impl From<ItemId> for usize {
@@ -801,9 +808,27 @@ If you encounter an error missing from this list, please file an issue or a PR!"
 
     /// Mangles a name so it doesn't conflict with any keyword.
     pub fn rust_mangle<'a>(&self, name: &'a str) -> Cow<'a, str> {
-        if name.contains("@") ||
-            name.contains("?") ||
-            name.contains("$") ||
+        let subs = [
+            ("@", "_"),
+            ("?", "_"),
+            ("$", "_"),
+            ("+", "_plus"),
+            ("&", "_bitand"),
+            ("|", "_bitor"),
+            ("^", "_bitxor"),
+            ("/", "_div"),
+            ("%", "_rem"),
+            ("<<", "shl"),
+            (">>", "shr"),
+            // Don't forget that "operator-" is both the name of the binary
+            // minus and the unary minus operator (a.k.a the negation operator).
+            ("-", "_minus"),
+            ("=", "_equal"),
+            ("[]", "_index"),
+            ("!", "_not"),
+        ];
+        let invalid_name = subs.iter().any(|sub| name.contains(sub.0));
+        if invalid_name ||
             match name {
                 "abstract" | "alignof" | "as" | "async" | "become" |
                 "box" | "break" | "const" | "continue" | "crate" | "do" |
@@ -821,9 +846,9 @@ If you encounter an error missing from this list, please file an issue or a PR!"
             }
         {
             let mut s = name.to_owned();
-            s = s.replace("@", "_");
-            s = s.replace("?", "_");
-            s = s.replace("$", "_");
+            for sub in subs.iter() {
+                s = s.replace(sub.0, sub.1);
+            }
             s.push_str("_");
             return Cow::Owned(s);
         }
