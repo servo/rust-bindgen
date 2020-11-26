@@ -854,6 +854,11 @@ If you encounter an error missing from this list, please file an issue or a PR!"
         })
     }
 
+    /// Get a mutable reference to a given ItemId.
+    pub fn get_item_mut(&mut self, id: ItemId) -> Option<&mut Item> {
+        self.items.get_mut(id.0)?.as_mut()
+    }
+
     /// Have we collected all unresolved type references yet?
     pub fn collected_typerefs(&self) -> bool {
         self.collected_typerefs

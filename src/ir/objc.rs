@@ -1,10 +1,10 @@
 //! Objective C types
 
-use super::context::{BindgenContext, ItemId};
+use super::context::{BindgenContext, ItemId, TypeId};
 use super::function::FunctionSig;
 use super::item::Item;
 use super::traversal::{Trace, Tracer};
-use super::ty::TypeKind;
+use super::ty::{Type, TypeKind};
 use crate::clang;
 use crate::parse::ClangItemParser;
 use clang_sys::CXChildVisit_Continue;
@@ -37,6 +37,9 @@ pub struct ObjCInterface {
     /// The list of protocols that this interface conforms to.
     pub conforms_to: Vec<ItemId>,
 
+    /// The list of categories (and the template tags) that this interface is extended by.
+    pub categories: Vec<(String, Vec<String>)>,
+
     /// The direct parent for this interface.
     pub parent_class: Option<ItemId>,
 
@@ -68,6 +71,7 @@ impl ObjCInterface {
         ObjCInterface {
             name: name.to_owned(),
             category: None,
+            categories: Vec::new(),
             is_protocol: false,
             template_names: Vec::new(),
             parent_class: None,
@@ -135,14 +139,23 @@ impl ObjCInterface {
             interface.is_protocol = true;
         }
 
+        // This is the ItemId for the real interface to which a category extends.  We must make it
+        // an optional, set it when we visit the ObjCCategoryDecl and then use it after we've
+        // visited the entire tree. We must do it in this order to ensure that this interface has
+        // all the template tags assigned to it.
+        let mut real_interface_id_for_category: Option<ItemId> = None;
+
         cursor.visit(|c| {
             match c.kind() {
                 CXCursor_ObjCClassRef => {
                     if cursor.kind() == CXCursor_ObjCCategoryDecl {
                         // We are actually a category extension, and we found the reference
-                        // to the original interface, so name this interface approriately
+                        // to the original interface, so name this interface approriately.
+
                         interface.name = c.spelling();
                         interface.category = Some(cursor.spelling());
+                        real_interface_id_for_category = Some(Item::from_ty_or_ref(c.cur_type(), c, None, ctx).into());
+
                     }
                 }
                 CXCursor_ObjCProtocolRef => {
@@ -194,7 +207,59 @@ impl ObjCInterface {
             }
             CXChildVisit_Continue
         });
+
+        if interface.is_category() {
+            // If this interface is a category, we need to find the interface that this category
+            // extends.
+            if let Some(ref mut ty) =
+                Self::get_parent_ty(ctx, real_interface_id_for_category)
+            {
+                if let TypeKind::ObjCInterface(ref mut real_interface) =
+                    ty.kind_mut()
+                {
+                    if !real_interface.is_category() {
+                        real_interface.categories.push((
+                            interface.rust_name(),
+                            interface.template_names.clone(),
+                        ));
+                    }
+                }
+            }
+        }
         Some(interface)
+    }
+
+    fn get_parent_ty(
+        ctx: &mut BindgenContext,
+        parent_id: Option<ItemId>,
+    ) -> Option<&mut Type> {
+        // This is pretty gross but using the ItemResolver doesn't yield a mutable reference.
+        let mut ty = ctx.resolve_item_fallible(parent_id?)?.kind().as_type()?;
+        let mut item_id: Option<&TypeId> = None;
+        loop {
+            match ty.kind() {
+                TypeKind::ResolvedTypeRef(ref_id) => {
+                    let ref_item: ItemId = ref_id.into();
+                    ty = ctx
+                        .resolve_item_fallible(ref_item)?
+                        .kind()
+                        .as_type()?;
+                    //ty = ref_item.kind().as_type()()?;;
+                    item_id = Some(ref_id);
+                }
+                TypeKind::ObjCInterface(..) => {
+                    break;
+                }
+                _ => return None,
+            };
+        }
+
+        let real_interface_id: ItemId = item_id?.into();
+        let ty = ctx
+            .get_item_mut(real_interface_id)?
+            .kind_mut()
+            .as_type_mut()?;
+        return Some(ty);
     }
 
     fn add_method(&mut self, method: ObjCMethod) {
