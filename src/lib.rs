@@ -1335,8 +1335,8 @@ impl Builder {
         self
     }
 
-    /// Generate the Rust bindings using the options built up thus far.
-    pub fn generate(mut self) -> Result<Bindings, ()> {
+    /// Generate the Rust bindings options
+    pub fn generate_options(mut self) -> Self {
         // Add any extra arguments from the environment to the clang command line.
         if let Some(extra_clang_args) =
             env::var("BINDGEN_EXTRA_CLANG_ARGS").ok()
@@ -1364,8 +1364,12 @@ impl Builder {
                     clang::UnsavedFile::new(&name, &contents)
                 }),
         );
+        self
+    }
 
-        Bindings::generate(self.options)
+    /// Generate the Rust bindings using the options built up thus far.
+    pub fn generate(self) -> Result<Bindings, ()> {
+        Bindings::generate(Builder::generate_options(self).options)
     }
 
     /// Preprocess and dump the input header files to disk.
@@ -1373,7 +1377,7 @@ impl Builder {
     /// This is useful when debugging bindgen, using C-Reduce, or when filing
     /// issues. The resulting file will be named something like `__bindgen.i` or
     /// `__bindgen.ii`
-    pub fn dump_preprocessed_input(&self) -> io::Result<()> {
+    pub fn dump_preprocessed_input(&mut self) -> io::Result<()> {
         let clang =
             clang_sys::support::Clang::find(None, &[]).ok_or_else(|| {
                 io::Error::new(
@@ -1381,7 +1385,7 @@ impl Builder {
                     "Cannot find clang executable",
                 )
             })?;
-
+        // Builder::generate_options(self);
         // The contents of a wrapper file that includes all the input header
         // files.
         let mut wrapper_contents = String::new();
@@ -2011,39 +2015,8 @@ fn find_effective_target(clang_args: &[String]) -> (String, bool) {
 }
 
 impl Bindings {
-    /// Generate bindings for the given options.
-    pub(crate) fn generate(
-        mut options: BindgenOptions,
-    ) -> Result<Bindings, ()> {
-        ensure_libclang_is_loaded();
-
-        #[cfg(feature = "runtime")]
-        debug!(
-            "Generating bindings, libclang at {}",
-            clang_sys::get_library().unwrap().path().display()
-        );
-        #[cfg(not(feature = "runtime"))]
-        debug!("Generating bindings, libclang linked");
-
-        options.build();
-
-        let (effective_target, explicit_target) =
-            find_effective_target(&options.clang_args);
-
-        let is_host_build =
-            rust_to_clang_target(HOST_TARGET) == effective_target;
-
-        // NOTE: The is_host_build check wouldn't be sound normally in some
-        // cases if we were to call a binary (if you have a 32-bit clang and are
-        // building on a 64-bit system for example).  But since we rely on
-        // opening libclang.so, it has to be the same architecture and thus the
-        // check is fine.
-        if !explicit_target && !is_host_build {
-            options
-                .clang_args
-                .insert(0, format!("--target={}", effective_target));
-        };
-
+    /// Common part of generate()
+    fn generate_common(options: &mut BindgenOptions) {
         fn detect_include_paths(options: &mut BindgenOptions) {
             if !options.detect_include_paths {
                 return;
@@ -2120,8 +2093,43 @@ impl Bindings {
                 }
             }
         }
+        detect_include_paths(options);
+    }
 
-        detect_include_paths(&mut options);
+    /// Generate bindings for the given options.
+    pub(crate) fn generate(
+        mut options: BindgenOptions,
+    ) -> Result<Bindings, ()> {
+        ensure_libclang_is_loaded();
+
+        #[cfg(feature = "runtime")]
+        debug!(
+            "Generating bindings, libclang at {}",
+            clang_sys::get_library().unwrap().path().display()
+        );
+        #[cfg(not(feature = "runtime"))]
+        debug!("Generating bindings, libclang linked");
+
+        options.build();
+
+        let (effective_target, explicit_target) =
+            find_effective_target(&options.clang_args);
+
+        let is_host_build =
+            rust_to_clang_target(HOST_TARGET) == effective_target;
+
+        // NOTE: The is_host_build check wouldn't be sound normally in some
+        // cases if we were to call a binary (if you have a 32-bit clang and are
+        // building on a 64-bit system for example).  But since we rely on
+        // opening libclang.so, it has to be the same architecture and thus the
+        // check is fine.
+        if !explicit_target && !is_host_build {
+            options
+                .clang_args
+                .insert(0, format!("--target={}", effective_target));
+        };
+
+        Bindings::generate_common(&mut options);
 
         #[cfg(unix)]
         fn can_read(perms: &std::fs::Permissions) -> bool {
