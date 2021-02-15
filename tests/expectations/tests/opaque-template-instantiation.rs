@@ -53,7 +53,7 @@ impl Default for ContainsInstantiation {
     }
 }
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Default)]
 pub struct ContainsOpaqueInstantiation {
     pub opaque: u32,
 }

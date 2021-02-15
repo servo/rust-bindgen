@@ -8,7 +8,7 @@
 /// <div rustbindgen opaque>
 #[repr(C)]
 #[repr(align(4))]
-#[derive(Debug, Default, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Default)]
 pub struct opaque {
     pub _bindgen_opaque_blob: u32,
 }
@@ -26,7 +26,7 @@ fn bindgen_test_layout_opaque() {
     );
 }
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Default)]
 pub struct container {
     pub contained: opaque,
 }

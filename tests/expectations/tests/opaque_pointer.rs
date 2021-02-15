@@ -8,7 +8,7 @@
 /// <div rustbindgen opaque></div>
 #[repr(C)]
 #[repr(align(4))]
-#[derive(Debug, Default, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Default)]
 pub struct OtherOpaque {
     pub _bindgen_opaque_blob: u32,
 }
@@ -27,12 +27,11 @@ fn bindgen_test_layout_OtherOpaque() {
 }
 /// <div rustbindgen opaque></div>
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Default)]
 pub struct Opaque {
     pub _address: u8,
 }
 #[repr(C)]
-#[derive(Debug, Copy, Clone, Hash, PartialEq)]
 pub struct WithOpaquePtr {
     pub whatever: *mut u8,
     pub other: u32,

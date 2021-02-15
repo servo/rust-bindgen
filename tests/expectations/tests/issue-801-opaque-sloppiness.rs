@@ -12,7 +12,7 @@ pub struct A {
 }
 #[repr(C)]
 #[repr(align(1))]
-#[derive(Debug, Default, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Default)]
 pub struct B {
     pub _bindgen_opaque_blob: u8,
 }
@@ -34,7 +34,7 @@ extern "C" {
     pub static mut B_a: A;
 }
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Default)]
 pub struct C {
     pub b: B,
 }

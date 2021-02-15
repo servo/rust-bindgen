@@ -6,7 +6,7 @@
 )]
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Default)]
 pub struct C {
     pub arr: [u32; 3usize],
 }
